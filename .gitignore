@@ -1,3 +1,4 @@
 /easy-service
 *.tmp
 
+.env
