@@ -5,14 +5,19 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
+	"net"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/example/easy-service/internal/health"
 	"github.com/example/easy-service/internal/process"
 )
 
@@ -87,7 +92,7 @@ func TestImageAppSymlinkCannotEscapePreparation(t *testing.T) {
 		t.Fatal(err)
 	}
 	r := Runtime{Data: t.TempDir()}
-	prepared, err := r.Prepare(context.Background(), "test", base, checkout, "", 80, nil)
+	prepared, err := r.Prepare(context.Background(), "test", base, checkout, "", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -110,12 +115,12 @@ func BenchmarkProcessTreeMemorySampling(b *testing.B) {
 
 func TestExitObservationPreservesWaitError(t *testing.T) {
 	bin := t.TempDir()
-	if err := os.WriteFile(filepath.Join(bin, "rootlesskit"), []byte("#!/bin/sh\nexit 23\n"), 0700); err != nil {
+	if err := os.WriteFile(filepath.Join(bin, "runsc"), []byte("#!/bin/sh\nexit 23\n"), 0700); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("PATH", bin+":"+os.Getenv("PATH"))
 	r := Runtime{Data: t.TempDir()}
-	i, err := r.start(context.Background(), "failed", t.TempDir(), "ignored", 80, nil)
+	i, err := r.start(context.Background(), "failed", t.TempDir(), "ignored", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -133,12 +138,12 @@ func TestExitObservationPreservesWaitError(t *testing.T) {
 func TestForcedStopReapsBeforeReturning(t *testing.T) {
 	bin, ready := t.TempDir(), filepath.Join(t.TempDir(), "ready")
 	helper := "#!/bin/sh\ntrap '' TERM\n: > \"$EASY_SERVICE_STOP_READY\"\nwhile :; do sleep 1; done\n"
-	if err := os.WriteFile(filepath.Join(bin, "rootlesskit"), []byte(helper), 0700); err != nil {
+	if err := os.WriteFile(filepath.Join(bin, "runsc"), []byte(helper), 0700); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("PATH", bin+":"+os.Getenv("PATH"))
 	t.Setenv("EASY_SERVICE_STOP_READY", ready)
-	i, err := (Runtime{Data: t.TempDir()}).start(context.Background(), "ignore-term", t.TempDir(), "ignored", 80, nil)
+	i, err := (Runtime{Data: t.TempDir()}).start(context.Background(), "ignore-term", t.TempDir(), "ignored", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -186,22 +191,92 @@ func TestExitedInstanceDoesNotSignalStalePID(t *testing.T) {
 	}
 }
 
-func TestRuntimeOwnsDNSAndHostLoopbackIsolation(t *testing.T) {
+func TestDirectRuntimeUsesDistinctPortsAndDockerDNS(t *testing.T) {
 	bin := t.TempDir()
-	// The process fake enforces the production network contract before exit.
-	helper := "#!/bin/sh\ncase \" $* \" in *' --disable-host-loopback '*) exit 0;; *) exit 1;; esac\n"
-	if err := os.WriteFile(filepath.Join(bin, "rootlesskit"), []byte(helper), 0700); err != nil {
-		t.Fatal(err)
-	}
-	t.Setenv("PATH", bin+":"+os.Getenv("PATH"))
-	bundle := t.TempDir()
-	r := Runtime{Data: t.TempDir()}
-	i, err := r.start(context.Background(), "network-test", bundle, "ignored", 80, nil)
+	executable, err := os.Executable()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := i.Wait(context.Background()); err != nil {
-		t.Fatal("host loopback access was allowed:", err)
+	// Only runsc execution is replaced; allocation, OCI spec, DNS and HTTP are real.
+	helper := "#!/bin/sh\nexec \"$EASY_SERVICE_RUNSC_BINARY\" -test.run=^TestDirectRunscHelper$ -- \"$@\"\n"
+	if err := os.WriteFile(filepath.Join(bin, "runsc"), []byte(helper), 0700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin+":"+os.Getenv("PATH"))
+	t.Setenv("EASY_SERVICE_RUNSC_BINARY", executable)
+	t.Setenv("EASY_SERVICE_RUNSC_HELPER", "1")
+	r := Runtime{Data: t.TempDir()}
+	resolver, err := os.ReadFile("/etc/resolv.conf")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ports := make(map[int]bool)
+	for _, id := range []string{"old", "candidate"} {
+		bundle := filepath.Join(r.Data, "instances", id)
+		i, err := r.start(context.Background(), id, bundle, id, []string{"PORT=wrong"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() {
+			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+			defer cancel()
+			_ = i.Stop(ctx)
+		})
+		if err := health.New(10*time.Millisecond, "/").Ready(context.Background(), i.Endpoint(), i, 5*time.Second); err != nil {
+			t.Fatal(err)
+		}
+		if ports[i.Port] || i.Port < 1024 {
+			t.Fatalf("overlapping deployments received invalid/shared port %d", i.Port)
+		}
+		ports[i.Port] = true
+		res, err := http.Get(i.Endpoint())
+		if err != nil {
+			t.Fatal(err)
+		}
+		body, err := io.ReadAll(res.Body)
+		_ = res.Body.Close()
+		if err != nil || string(body) != id {
+			t.Fatalf("deployment endpoint reached wrong workload: %q %v", body, err)
+		}
+		b, err := os.ReadFile(filepath.Join(bundle, "config.json"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		var spec Spec
+		if err := json.Unmarshal(b, &spec); err != nil {
+			t.Fatal(err)
+		}
+		found := false
+		for _, mount := range spec.Mounts {
+			if mount.Destination == "/etc/resolv.conf" {
+				contents, err := os.ReadFile(mount.Source)
+				if err != nil || string(contents) != string(resolver) || !filepath.IsAbs(mount.Source) || !strings.Contains(strings.Join(mount.Options, ","), "ro") {
+					t.Fatalf("owned read-only Docker DNS mount: %+v %v", mount, err)
+				}
+				found = true
+			}
+		}
+		if !found {
+			t.Fatal("runtime did not provide Docker DNS")
+		}
+	}
+}
+
+func TestDirectRunscHelper(t *testing.T) {
+	if os.Getenv("EASY_SERVICE_RUNSC_HELPER") != "1" {
+		return
+	}
+	args := strings.Join(os.Args, " ")
+	for _, required := range []string{"--rootless=true", "--platform=systrap", "--directfs=false", "--overlay2=none", "--network=host"} {
+		if !strings.Contains(args, required) {
+			t.Fatal("missing direct gVisor argument:", required)
+		}
+	}
+	var bundle string
+	for n, arg := range os.Args {
+		if arg == "--bundle" && n+1 < len(os.Args) {
+			bundle = os.Args[n+1]
+		}
 	}
 	b, err := os.ReadFile(filepath.Join(bundle, "config.json"))
 	if err != nil {
@@ -211,16 +286,28 @@ func TestRuntimeOwnsDNSAndHostLoopbackIsolation(t *testing.T) {
 	if err := json.Unmarshal(b, &spec); err != nil {
 		t.Fatal(err)
 	}
-	for _, mount := range spec.Mounts {
-		if mount.Destination == "/etc/resolv.conf" {
-			contents, err := os.ReadFile(mount.Source)
-			if err != nil || string(contents) != "nameserver 10.0.2.3\n" || !filepath.IsAbs(mount.Source) || !strings.Contains(strings.Join(mount.Options, ","), "ro") {
-				t.Fatalf("private read-only DNS mount: %+v %q %v", mount, contents, err)
+	if !spec.Process.NoNewPrivileges || spec.Process.Cwd != "/app" {
+		t.Fatal("workload restrictions changed")
+	}
+	var port int
+	for _, item := range spec.Process.Env {
+		if strings.HasPrefix(item, "PORT=") {
+			port, err = strconv.Atoi(strings.TrimPrefix(item, "PORT="))
+			if err != nil {
+				t.Fatal(err)
 			}
-			return
 		}
 	}
-	t.Fatal("runtime did not provide private-network DNS")
+	listener, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", port))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	if err := http.Serve(listener, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		fmt.Fprint(w, spec.Process.Args[2])
+	})); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func TestProcessTreeMemoryIncludesChildFromAnotherThread(t *testing.T) {

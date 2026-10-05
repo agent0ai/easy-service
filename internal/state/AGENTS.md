@@ -14,7 +14,7 @@ Own persistent active state and reconciliation after supervisor restart.
 - Keep only revision, digest, Git source URL and image reference in the active record; process IDs and filesystem paths are discovered from live runtimes instead of saved state. Ignore obsolete fields when reading older records.
 - `Within` owns the shared lexical cleanup-boundary check used by reconciliation and the engine; exclude the root itself, sibling prefixes and paths outside the root.
 - Verify live process ownership before signaling a process group; never trust a PID from older state.
-- Discover unrecorded setup/candidate groups once at startup using same-user rootlesskit executables and exact owned runsc root/bundle paths.
+- Discover unrecorded setup/candidate groups once at startup using same-user runsc executables and exact owned root/bundle paths.
 - Kill owned orphan groups and wait for observed members to stop before deleting their filesystems; compare process start times to avoid waiting on reused PIDs.
 - Sync the state directory after clearing the active record.
 - Reconcile stale runtime state before a new deployment.

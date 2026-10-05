@@ -22,11 +22,11 @@ import (
 
 type runtimeAdapter struct{ sandbox.Runtime }
 
-func (r runtimeAdapter) Start(c, lifetime context.Context, a, b, d string, p int, e []string) (supervisor.Instance, error) {
-	return r.Runtime.Start(c, lifetime, a, b, d, p, e)
+func (r runtimeAdapter) Start(c, lifetime context.Context, a, b, d string, e []string) (supervisor.Instance, error) {
+	return r.Runtime.Start(c, lifetime, a, b, d, e)
 }
-func (r runtimeAdapter) Restart(c context.Context, a, b, d string, p int, e []string) (supervisor.Instance, error) {
-	return r.Runtime.Restart(c, a, b, d, p, e)
+func (r runtimeAdapter) Restart(c context.Context, a, b, d string, e []string) (supervisor.Instance, error) {
+	return r.Runtime.Restart(c, a, b, d, e)
 }
 func main() {
 	if len(os.Args) > 1 {

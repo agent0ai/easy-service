@@ -61,7 +61,7 @@ func (i *httpInstance) Stop(context.Context) error {
 	})
 	return nil
 }
-func (r *httpRuntime) Start(op, lifetime context.Context, id, prepared, _ string, _ int, _ []string) (Instance, error) {
+func (r *httpRuntime) Start(op, lifetime context.Context, id, prepared, _ string, _ []string) (Instance, error) {
 	bundle := filepath.Join(r.Data, "instances", id)
 	if err := sandbox.CopyTree(op, filepath.Join(prepared, "rootfs"), filepath.Join(bundle, "rootfs")); err != nil {
 		_ = os.RemoveAll(bundle)
@@ -72,7 +72,7 @@ func (r *httpRuntime) Start(op, lifetime context.Context, id, prepared, _ string
 	r.mu.Unlock()
 	return r.launch(lifetime, id, bundle)
 }
-func (r *httpRuntime) Restart(lifetime context.Context, id, bundle, _ string, _ int, _ []string) (Instance, error) {
+func (r *httpRuntime) Restart(lifetime context.Context, id, bundle, _ string, _ []string) (Instance, error) {
 	r.mu.Lock()
 	r.restarts++
 	r.mu.Unlock()
@@ -127,7 +127,7 @@ func TestStreamingDeploymentCutoverAndDrain(t *testing.T) {
 			}
 			first := commitVersion(t, origin, "one")
 			data := t.TempDir()
-			cfg := config.Config{DataDir: data, GitURL: origin, RuntimeImage: "test-image", ServicePort: 80, StartupTimeout: time.Second, HealthInterval: 100 * time.Millisecond, HealthFailures: 3}
+			cfg := config.Config{DataDir: data, GitURL: origin, RuntimeImage: "test-image", StartupTimeout: time.Second, HealthInterval: 100 * time.Millisecond, HealthFailures: 3}
 			git := revision.New(origin, "", data)
 			ctx, cancel := context.WithCancel(context.Background())
 			e := &Engine{Cfg: cfg, Runtime: &httpRuntime{Runtime: sandbox.Runtime{Data: data}}, Checkout: git, Proxy: proxy.New(), Store: state.Store{Data: data}, Health: health.New(cfg.HealthInterval, "/health"), Rootfs: t.TempDir(), Digest: "sha256:test", Drain: 300 * time.Millisecond, RuntimeContext: ctx, Failures: make(chan uint64, 1)}

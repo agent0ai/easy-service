@@ -12,8 +12,6 @@ services:
       RUN_COMMAND: node server.js
     volumes:
       - easy-service-data:/data
-    devices:
-      - /dev/net/tun:/dev/net/tun
     security_opt:
       - seccomp=unconfined
 volumes:

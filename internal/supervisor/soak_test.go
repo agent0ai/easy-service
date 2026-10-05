@@ -54,7 +54,7 @@ func TestDeploymentSoak(t *testing.T) {
 	data := t.TempDir()
 	// Leave scheduling headroom for concurrent traffic and the race detector.
 	// Short deadline and stalled-probe behavior have separate focused tests.
-	cfg := config.Config{DataDir: data, GitURL: origin, RuntimeImage: "test-image", RunCommand: "owned-http-boundary", ServicePort: 80, StartupTimeout: time.Second, HealthInterval: 250 * time.Millisecond, HealthFailures: 3}
+	cfg := config.Config{DataDir: data, GitURL: origin, RuntimeImage: "test-image", RunCommand: "owned-http-boundary", StartupTimeout: time.Second, HealthInterval: 250 * time.Millisecond, HealthFailures: 3}
 	rt := &httpRuntime{Runtime: sandbox.Runtime{Data: data}}
 	git := revision.New(origin, "", data)
 	ctx, cancel := context.WithCancel(context.Background())

@@ -82,6 +82,7 @@ Default section order:
 - Fix the shared owner of a defect and verify its regression plus the affected end-to-end path; do not hide shared defects with caller coercions, retries, fallbacks or duplicated logic.
 - Keep this DOX hierarchy current with meaningful changes.
 - Keep README.md simple: lead with the five basic launch settings, show the container CLI, then list optional settings.
+- Launch gVisor directly as 8020 does, sharing the outer container's network with an automatically assigned PORT per instance; do not add RootlessKit/slirp4netns, TUN access or subordinate UID/GID setup.
 
 ## Child DOX Index
 
@@ -121,7 +122,7 @@ public environment-variable surface exactly aligned with README.md and
 internal/config. Production code must not add a host Docker-socket dependency.
 
 Memory pressure is an approximately one-second soft observation of the active
-rootlesskit/runsc process tree. It must enter the serialized deployment engine
+runsc process tree. It must enter the serialized deployment engine
 as a same-revision blue/green replacement request; it may not create a second
 cutover, readiness, drain, or recovery state machine.
 

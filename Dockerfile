@@ -21,11 +21,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates
 
 FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      ca-certificates git skopeo umoci rootlesskit slirp4netns uidmap tini coreutils libcap2-bin \
+      ca-certificates git skopeo umoci tini coreutils libcap2-bin \
  && rm -rf /var/lib/apt/lists/* \
- && useradd --uid 10000 --create-home --shell /usr/sbin/nologin easyservice \
- && echo 'easyservice:100000:65536' >> /etc/subuid \
- && echo 'easyservice:100000:65536' >> /etc/subgid
+ && useradd --uid 10000 --create-home --shell /usr/sbin/nologin easyservice
 COPY --from=build /out/easy-service /usr/local/bin/easy-service
 COPY --from=runsc /out/ /usr/local/bin/
 RUN setcap cap_net_bind_service=+ep /usr/local/bin/easy-service \

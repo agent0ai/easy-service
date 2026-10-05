@@ -76,7 +76,7 @@ func reconcileProcess(t *testing.T, data, name, area string, ignoreTerm bool) (*
 		t.Fatal(err)
 	}
 	ready := filepath.Join(bundle, "running")
-	cmd := exec.Command(helper, "-test.run=TestReconcileHelperProcess", "--", "runsc", "--rootless=true", "--network=host", "--file-access=exclusive", "--root", filepath.Join(data, "runsc-root", "orphan"), "run", "--bundle", bundle, "orphan")
+	cmd := exec.Command(helper, "-test.run=TestReconcileHelperProcess", "--", "--rootless=true", "--network=host", "--file-access=exclusive", "--root", filepath.Join(data, "runsc-root", "orphan"), "run", "--bundle", bundle, "orphan")
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	cmd.Env = []string{"EASY_SERVICE_RECONCILE_HELPER=1", "EASY_SERVICE_READY=" + ready}
 	if ignoreTerm {
@@ -105,7 +105,7 @@ func TestReconcileStopsUnrecordedAndUncooperativeRuntime(t *testing.T) {
 	for _, area := range []string{"instances", "prepared"} {
 		t.Run(area, func(t *testing.T) {
 			data := t.TempDir()
-			_, done := reconcileProcess(t, data, "rootlesskit", area, true)
+			_, done := reconcileProcess(t, data, "runsc", area, true)
 			if err := (Store{data}).Reconcile(); err != nil {
 				t.Fatal(err)
 			}
@@ -119,11 +119,11 @@ func TestReconcileStopsUnrecordedAndUncooperativeRuntime(t *testing.T) {
 }
 
 func TestReconcileDoesNotSignalUnrelatedPID(t *testing.T) {
-	for _, name := range []string{"rootlesskit", "unrelated-rootlesskit"} {
+	for _, name := range []string{"runsc", "unrelated-runsc"} {
 		t.Run(name, func(t *testing.T) {
 			data := t.TempDir()
 			actualData := data
-			if name == "rootlesskit" {
+			if name == "runsc" {
 				actualData = t.TempDir()
 			}
 			cmd, done := reconcileProcess(t, actualData, name, "instances", false)

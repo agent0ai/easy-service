@@ -7,12 +7,13 @@ Own the supervisor executable and its process lifetime.
 - `easy-service/main.go` wires configuration, prerequisite validation, persisted state, image preparation, controller, proxy and shutdown.
 - `easy-service/cli.go` implements the same binary's `status`, `redeploy`, `restart` and help commands through the supervisor's Unix socket; CLI dispatch precedes configuration loading and sandbox validation.
 - `runtimeAdapter` bridges the sandbox implementation to the supervisor runtime contract.
-- `easy-service/real_test.go` owns the opt-in lifecycle check with actual Git, OCI tooling, rootless gVisor, setup/DNS, readiness, routing and bad-candidate rejection.
+- `easy-service/real_test.go` owns the opt-in lifecycle check with actual Git, OCI tooling and a pinned BusyBox image, direct rootless gVisor, persistent setup writes/Docker DNS, overlapping revision ports, readiness, routing, bad-candidate rejection, memory sampling and orphan reconciliation.
 - Lifecycle policy belongs to `internal/supervisor`; isolation belongs to `internal/sandbox`.
 
 ## Local Contracts
 
 - Fail startup if rootless gVisor prerequisites or restart reconciliation fail.
+- Runtime adapters pass commands/environment to direct runsc; sandbox owns PORT allocation and shared-network endpoints.
 - Keep runtime process lifetime separate from polling/signal cancellation so HTTP drain finishes before sandbox termination.
 - Propagate fatal owner errors to the process; keep transient image/revision failures retryable through their owning subsystem.
 - Use `State.Recoverable` for prior revision recovery; both configured Git source and runtime image must match. Cached image recovery depends only on the runtime image.

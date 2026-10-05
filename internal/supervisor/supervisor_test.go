@@ -80,7 +80,6 @@ type fr struct {
 	mu               sync.Mutex
 	starts, restarts int
 	failStarts       int
-	preparePort      int
 	data             string
 	memory           uint64
 	instances        []*fi
@@ -92,8 +91,8 @@ type contextRuntime struct {
 	contexts []context.Context
 }
 
-func (r *contextRuntime) Start(op, ctx context.Context, id, prepared, command string, port int, env []string) (Instance, error) {
-	i, err := r.fr.Start(op, ctx, id, prepared, command, port, env)
+func (r *contextRuntime) Start(op, ctx context.Context, id, prepared, command string, env []string) (Instance, error) {
+	i, err := r.fr.Start(op, ctx, id, prepared, command, env)
 	if err != nil {
 		return nil, err
 	}
@@ -110,8 +109,7 @@ func (r *contextRuntime) Start(op, ctx context.Context, id, prepared, command st
 	return i, nil
 }
 
-func (r *fr) Prepare(_ context.Context, id string, _ string, _ string, _ string, port int, _ []string) (string, error) {
-	r.preparePort = port
+func (r *fr) Prepare(_ context.Context, id string, _ string, _ string, _ string, _ []string) (string, error) {
 	prepared := filepath.Join(r.data, "prepared", id)
 	if err := os.MkdirAll(filepath.Join(prepared, "rootfs", "app"), 0700); err != nil {
 		return "", err
@@ -124,7 +122,7 @@ func (r *fr) Prepare(_ context.Context, id string, _ string, _ string, _ string,
 func (r *fr) ValidatePrepared(path string) error {
 	return (sandbox.Runtime{}).ValidatePrepared(path)
 }
-func (r *fr) Start(context.Context, context.Context, string, string, string, int, []string) (Instance, error) {
+func (r *fr) Start(context.Context, context.Context, string, string, string, []string) (Instance, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.starts++
@@ -136,7 +134,7 @@ func (r *fr) Start(context.Context, context.Context, string, string, string, int
 	r.instances = append(r.instances, i)
 	return i, nil
 }
-func (r *fr) Restart(context.Context, string, string, string, int, []string) (Instance, error) {
+func (r *fr) Restart(context.Context, string, string, string, []string) (Instance, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.restarts++
@@ -151,7 +149,7 @@ func TestFailedCandidatePreservesBackendContract(t *testing.T) {
 	d := t.TempDir()
 	sha := "0123456789012345678901234567890123456789"
 	r := &fr{data: d}
-	e := &Engine{Cfg: config.Config{DataDir: d, RunCommand: "x", ServicePort: 80, StartupTimeout: time.Millisecond, HealthInterval: time.Millisecond, HealthFailures: 1}, Runtime: r, Checkout: checkoutFake{}, Proxy: p, Store: state.Store{Data: t.TempDir()}, Health: health.New(time.Millisecond, "/"), Rootfs: t.TempDir(), Digest: "sha256:digest", Drain: time.Millisecond, Failures: make(chan uint64, 1)}
+	e := &Engine{Cfg: config.Config{DataDir: d, RunCommand: "x", StartupTimeout: time.Millisecond, HealthInterval: time.Millisecond, HealthFailures: 1}, Runtime: r, Checkout: checkoutFake{}, Proxy: p, Store: state.Store{Data: t.TempDir()}, Health: health.New(time.Millisecond, "/"), Rootfs: t.TempDir(), Digest: "sha256:digest", Drain: time.Millisecond, Failures: make(chan uint64, 1)}
 	if e.Deploy(context.Background(), revision.Selection{SHA: sha}) == nil {
 		t.Fatal("candidate unexpectedly healthy")
 	}
@@ -179,7 +177,7 @@ func engineFor(t *testing.T, h Health) (*Engine, *fr) {
 	t.Helper()
 	d := t.TempDir()
 	sha := "0123456789012345678901234567890123456789"
-	prep := filepath.Join(d, "prepared", preparedID(sha, "sha256:digest", config.Config{ServicePort: 80}))
+	prep := filepath.Join(d, "prepared", preparedID(sha, "sha256:digest", config.Config{}))
 	if err := os.MkdirAll(filepath.Join(prep, "rootfs", "app"), 0700); err != nil {
 		t.Fatal(err)
 	}
@@ -187,7 +185,7 @@ func engineFor(t *testing.T, h Health) (*Engine, *fr) {
 		t.Fatal(err)
 	}
 	r := &fr{data: d}
-	e := &Engine{Cfg: config.Config{DataDir: d, RuntimeImage: "image", RunCommand: "x", ServicePort: 80, StartupTimeout: time.Second, HealthInterval: time.Millisecond, HealthFailures: 1}, Runtime: r, Checkout: checkoutFake{}, Proxy: proxy.New(), Store: state.Store{Data: d}, Health: h, Rootfs: t.TempDir(), Digest: "sha256:digest", Drain: time.Millisecond, Failures: make(chan uint64, 4)}
+	e := &Engine{Cfg: config.Config{DataDir: d, RuntimeImage: "image", RunCommand: "x", StartupTimeout: time.Second, HealthInterval: time.Millisecond, HealthFailures: 1}, Runtime: r, Checkout: checkoutFake{}, Proxy: proxy.New(), Store: state.Store{Data: d}, Health: h, Rootfs: t.TempDir(), Digest: "sha256:digest", Drain: time.Millisecond, Failures: make(chan uint64, 4)}
 	t.Cleanup(func() { e.Shutdown(context.Background()) })
 	return e, r
 }
@@ -230,7 +228,6 @@ func TestPreparationCacheTracksSetupInputs(t *testing.T) {
 	for _, change := range []func(){
 		func() { e.Cfg.SetupCommand = "install new dependencies" },
 		func() { e.Cfg.AppEnv = []string{"MODE=new"} },
-		func() { e.Cfg.ServicePort = 8080 },
 	} {
 		before := e.active.Prepared
 		change()
@@ -345,9 +342,6 @@ func TestInitialDeploymentRetriesAtHealthInterval(t *testing.T) {
 			t.Fatal("initial deployment waited for the poll interval instead of retrying")
 		case <-time.After(time.Millisecond):
 		}
-	}
-	if r.preparePort != e.Cfg.ServicePort {
-		t.Fatalf("setup PORT=%d, want %d", r.preparePort, e.Cfg.ServicePort)
 	}
 	cancel()
 	select {

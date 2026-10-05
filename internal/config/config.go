@@ -16,7 +16,7 @@ type Config struct {
 	GitURL, GitToken, GitBranch, UpdateMethod, UpdatePattern    string
 	RuntimeImage, SetupCommand, RunCommand, HealthPath, DataDir string
 	PollInterval, StartupTimeout, HealthInterval                time.Duration
-	ServicePort, HealthFailures                                 int
+	HealthFailures                                              int
 	ServiceMemoryLimit                                          uint64
 	AppEnv                                                      []string
 }
@@ -31,9 +31,6 @@ func Load() (Config, error) {
 		return c, err
 	}
 	if c.HealthInterval, err = duration("HEALTH_INTERVAL", 10); err != nil {
-		return c, err
-	}
-	if c.ServicePort, err = integer("SERVICE_PORT", 80); err != nil {
 		return c, err
 	}
 	if c.HealthFailures, err = integer("HEALTH_FAILURES", 3); err != nil {
@@ -81,9 +78,6 @@ func Load() (Config, error) {
 	}
 	if c.HealthPath == "" || c.HealthPath[0] != '/' {
 		return c, fmt.Errorf("HEALTH_PATH must begin with /")
-	}
-	if c.ServicePort > 65535 {
-		return c, fmt.Errorf("SERVICE_PORT must be <= 65535")
 	}
 	return c, nil
 }

@@ -9,11 +9,11 @@ Own rootless gVisor isolation, private application filesystems and sandbox proce
 
 ## Local Contracts
 
-- Require rootlesskit/runsc/slirp4netns, nested user namespaces, TUN and cgroup v2; fail closed.
+- Require runsc and user namespaces; launch rootless systrap directly with directfs disabled and shared outer-container networking. Fail closed; require no TUN, subordinate UID/GID mappings or cgroup controller.
 - Never add host Docker-socket access or substitute runc/host execution in production.
-- Disable slirp access to supervisor host-loopback ports in preflight and every workload/setup launch.
-- Mount an owned read-only resolv.conf targeting the default slirp DNS endpoint (10.0.2.3); OCI images may omit resolver configuration. Change DNS and rootless network addressing together.
-- Copy disk-backed private rootfs trees; replace image `/app` before copying checkout content so host copies cannot follow its symlink.
+- Assign an available PORT on every setup, start and restart; the proxy endpoint must match it so overlapping revisions can serve concurrently. Applications must listen on PORT; no fixed SERVICE_PORT option remains.
+- Mount an owned read-only copy of the outer container's resolv.conf; OCI images may omit resolver configuration.
+- Copy disk-backed private rootfs trees and disable runsc's additional root overlay so setup/runtime writes persist in that owned tree; replace image `/app` before copying checkout content so host copies cannot follow its symlink.
 - Setup is bounded to fifteen minutes and stops before failed preparation is removed.
 - Separate filesystem-operation cancellation from running sandbox lifetime.
 - `Done` is a closed broadcast; repeated `Wait` calls preserve the exit result.
@@ -29,6 +29,7 @@ Own rootless gVisor isolation, private application filesystems and sandbox proce
 ## Verification
 
 - `go test -race ./internal/sandbox`.
+- `TestDirectRuntimeUsesDistinctPortsAndDockerDNS` exercises production allocation/spec/DNS with overlapping HTTP helper processes replacing only runsc execution.
 - `go test ./internal/sandbox -run '^$' -bench . -benchmem` measures RSS sampling.
 - Real gVisor startup requires the host prerequisites in `../../README.md`; passing fakes does not prove host isolation works.
 

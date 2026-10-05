@@ -68,29 +68,15 @@ type Runtime struct {
 }
 
 func Validate() error {
-	for _, n := range []string{"runsc", "rootlesskit", "slirp4netns"} {
-		if _, e := exec.LookPath(n); e != nil {
-			return fmt.Errorf("mandatory rootless gVisor prerequisite %s not found", n)
-		}
+	if _, e := exec.LookPath("runsc"); e != nil {
+		return fmt.Errorf("mandatory rootless gVisor prerequisite runsc not found")
 	}
 	if _, e := os.Stat("/proc/self/ns/user"); e != nil {
 		return fmt.Errorf("user namespaces unavailable: %w", e)
 	}
-	if st, e := os.Stat("/dev/net/tun"); e != nil || st.Mode()&os.ModeDevice == 0 {
-		return fmt.Errorf("rootless sandbox networking requires /dev/net/tun")
-	}
-	if _, e := os.Stat("/sys/fs/cgroup/cgroup.controllers"); e != nil {
-		return fmt.Errorf("cgroup v2 is required: %w", e)
-	}
 	b, e := os.ReadFile("/proc/sys/kernel/unprivileged_userns_clone")
 	if e == nil && strings.TrimSpace(string(b)) == "0" {
 		return fmt.Errorf("unprivileged user namespaces are disabled")
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	cmd := process.Command(ctx, "rootlesskit", "--net=slirp4netns", "--disable-host-loopback", "--port-driver=builtin", "--", "true")
-	if b, e := process.Output(cmd); e != nil {
-		return fmt.Errorf("nested rootless networking preflight failed: %w: %s", e, strings.TrimSpace(string(b)))
 	}
 	return nil
 }
@@ -104,7 +90,7 @@ func CopyTree(ctx context.Context, src, dst string) error {
 	}
 	return nil
 }
-func (r Runtime) Prepare(ctx context.Context, id, base, checkout, setup string, servicePort int, env []string) (result string, err error) {
+func (r Runtime) Prepare(ctx context.Context, id, base, checkout, setup string, env []string) (result string, err error) {
 	dir := filepath.Join(r.Data, "prepared", id)
 	defer func() {
 		if err != nil {
@@ -129,7 +115,7 @@ func (r Runtime) Prepare(ctx context.Context, id, base, checkout, setup string, 
 	if setup != "" {
 		op, cancel := context.WithTimeout(ctx, 15*time.Minute)
 		defer cancel()
-		i, e := r.start(op, "setup-"+id, dir, setup, servicePort, env)
+		i, e := r.start(op, "setup-"+id, dir, setup, env)
 		if e != nil {
 			return "", e
 		}
@@ -155,7 +141,7 @@ func (r Runtime) ValidatePrepared(dir string) error {
 	}
 	return nil
 }
-func (r Runtime) Start(ctx, lifetime context.Context, id, prepared, command string, servicePort int, env []string) (*Instance, error) {
+func (r Runtime) Start(ctx, lifetime context.Context, id, prepared, command string, env []string) (*Instance, error) {
 	bundle := filepath.Join(r.Data, "instances", id)
 	root := filepath.Join(r.Data, "runsc-root", id)
 	ok := false
@@ -174,13 +160,13 @@ func (r Runtime) Start(ctx, lifetime context.Context, id, prepared, command stri
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	i, err := r.start(lifetime, id, bundle, command, servicePort, env)
+	i, err := r.start(lifetime, id, bundle, command, env)
 	ok = err == nil
 	return i, err
 }
-func (r Runtime) Restart(ctx context.Context, id, bundle, command string, servicePort int, env []string) (*Instance, error) {
+func (r Runtime) Restart(ctx context.Context, id, bundle, command string, env []string) (*Instance, error) {
 	root := filepath.Join(r.Data, "runsc-root", id)
-	i, err := r.start(ctx, id, bundle, command, servicePort, env)
+	i, err := r.start(ctx, id, bundle, command, env)
 	if err != nil {
 		_ = os.RemoveAll(root)
 	}
@@ -235,7 +221,7 @@ func processTreeRSS(root int) (uint64, error) {
 		}
 		total += pages * uint64(os.Getpagesize())
 		// A process can fork from any thread. The leader's children file alone
-		// would miss subprocesses started by other runsc/rootlesskit threads.
+		// would miss subprocesses started by other runsc threads.
 		tasks, err := os.ReadDir(filepath.Join(dir, "task"))
 		if err != nil {
 			continue
@@ -259,27 +245,30 @@ func (i *Instance) Endpoint() string   { return fmt.Sprintf("http://127.0.0.1:%d
 func (i *Instance) BundlePath() string { return i.Bundle }
 func (i *Instance) RootPath() string   { return i.Root }
 func (i *Instance) Done() <-chan error { return i.done }
-func (r Runtime) start(ctx context.Context, id, bundle, command string, servicePort int, env []string) (*Instance, error) {
+func (r Runtime) start(ctx context.Context, id, bundle, command string, env []string) (*Instance, error) {
 	if e := os.MkdirAll(bundle, 0700); e != nil {
 		return nil, e
 	}
-	port := 0
-	if servicePort > 0 {
-		l, e := net.Listen("tcp", "127.0.0.1:0")
-		if e != nil {
-			return nil, e
-		}
-		port = l.Addr().(*net.TCPAddr).Port
-		l.Close()
+	l, e := net.Listen("tcp", "127.0.0.1:0")
+	if e != nil {
+		return nil, e
 	}
-	spec := Spec{OCIVersion: "1.0.2", Process: Process{User: User{0, 0}, Args: []string{"/bin/sh", "-c", command}, Env: workloadEnv(env, servicePort), Cwd: "/app", NoNewPrivileges: true}, Root: Root{"rootfs", false}, Mounts: []Mount{{"/proc", "proc", "proc", nil}, {"/dev", "tmpfs", "tmpfs", []string{"nosuid", "strictatime", "mode=755", "size=65536k"}}, {"/tmp", "tmpfs", "tmpfs", []string{"nosuid", "nodev", "mode=1777", "size=64m"}}}, Linux: Linux{[]Namespace{{"pid"}, {"ipc"}, {"uts"}, {"mount"}}}}
-	// OCI images need not contain resolv.conf. Slirp's default private DNS
-	// endpoint belongs to this network, independent of the supervisor resolver.
+	port := l.Addr().(*net.TCPAddr).Port
+	// ponytail: release before the app binds; use socket activation if atomic handoff is needed.
+	if e := l.Close(); e != nil {
+		return nil, e
+	}
+	spec := Spec{OCIVersion: "1.0.2", Process: Process{User: User{0, 0}, Args: []string{"/bin/sh", "-c", command}, Env: workloadEnv(env, port), Cwd: "/app", NoNewPrivileges: true}, Root: Root{"rootfs", false}, Mounts: []Mount{{"/proc", "proc", "proc", nil}, {"/dev", "tmpfs", "tmpfs", []string{"nosuid", "strictatime", "mode=755", "size=65536k"}}, {"/tmp", "tmpfs", "tmpfs", []string{"nosuid", "nodev", "mode=1777", "size=64m"}}}, Linux: Linux{[]Namespace{{"pid"}, {"ipc"}, {"uts"}, {"mount"}}}}
+	// Share Docker's DNS configuration without exposing its writable host file.
 	dns, e := filepath.Abs(filepath.Join(bundle, "resolv.conf"))
 	if e != nil {
 		return nil, e
 	}
-	if e := os.WriteFile(dns, []byte("nameserver 10.0.2.3\n"), 0600); e != nil {
+	resolver, e := os.ReadFile("/etc/resolv.conf")
+	if e != nil {
+		return nil, e
+	}
+	if e := os.WriteFile(dns, resolver, 0600); e != nil {
 		return nil, e
 	}
 	spec.Mounts = append(spec.Mounts, Mount{"/etc/resolv.conf", "bind", dns, []string{"bind", "ro", "nosuid", "nodev", "noexec"}})
@@ -287,13 +276,8 @@ func (r Runtime) start(ctx context.Context, id, bundle, command string, serviceP
 	if e := os.WriteFile(filepath.Join(bundle, "config.json"), b, 0600); e != nil {
 		return nil, e
 	}
-	args := []string{"--net=slirp4netns", "--disable-host-loopback", "--port-driver=builtin"}
-	if port > 0 {
-		args = append(args, "-p", fmt.Sprintf("127.0.0.1:%d:%d/tcp", port, servicePort))
-	}
 	root := filepath.Join(r.Data, "runsc-root", id)
-	args = append(args, "--", "runsc", "--rootless=true", "--network=host", "--file-access=exclusive", "--root", root, "run", "--bundle", bundle, id)
-	cmd := process.Command(ctx, "rootlesskit", args...)
+	cmd := process.Command(ctx, "runsc", "--rootless=true", "--platform=systrap", "--directfs=false", "--overlay2=none", "--network=host", "--file-access=exclusive", "--root", root, "run", "--bundle", bundle, id)
 	phase, logID := "run", id
 	if strings.HasPrefix(id, "setup-") {
 		phase, logID = "setup", strings.TrimPrefix(id, "setup-")

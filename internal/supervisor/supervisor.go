@@ -31,11 +31,11 @@ type Instance interface {
 	MemoryUsage() (uint64, error)
 }
 type Runtime interface {
-	Prepare(context.Context, string, string, string, string, int, []string) (string, error)
+	Prepare(context.Context, string, string, string, string, []string) (string, error)
 	ValidatePrepared(string) error
 	// Start separates filesystem-operation cancellation from process lifetime.
-	Start(context.Context, context.Context, string, string, string, int, []string) (Instance, error)
-	Restart(context.Context, string, string, string, int, []string) (Instance, error)
+	Start(context.Context, context.Context, string, string, string, []string) (Instance, error)
+	Restart(context.Context, string, string, string, []string) (Instance, error)
 }
 type Checkout interface {
 	Checkout(context.Context, string, string) error
@@ -139,7 +139,7 @@ func (e *Engine) deploy(ctx, watchCtx context.Context, sel revision.Selection, e
 	// Runtime.Start binds the sandbox process lifetime to its context. Operations
 	// and health watches may be cancelled before graceful proxy drain completes,
 	// so active processes use the engine-owned runtime context instead.
-	candidate, err := e.Runtime.Start(ctx, e.runtimeContext(watchCtx), id, prepared, e.Cfg.RunCommand, e.Cfg.ServicePort, e.Cfg.AppEnv)
+	candidate, err := e.Runtime.Start(ctx, e.runtimeContext(watchCtx), id, prepared, e.Cfg.RunCommand, e.Cfg.AppEnv)
 	if err != nil {
 		e.invalidatePrepared(prepared)
 		return fmt.Errorf("start candidate: %w", err)
@@ -209,7 +209,7 @@ func (e *Engine) ensurePrepared(ctx context.Context, sha, id string) (string, er
 	if err := e.Checkout.Checkout(ctx, sha, checkout); err != nil {
 		return "", fmt.Errorf("checkout candidate: %w", err)
 	}
-	result, err := e.Runtime.Prepare(ctx, prepID, e.Rootfs, checkout, e.Cfg.SetupCommand, e.Cfg.ServicePort, e.Cfg.AppEnv)
+	result, err := e.Runtime.Prepare(ctx, prepID, e.Rootfs, checkout, e.Cfg.SetupCommand, e.Cfg.AppEnv)
 	if err != nil {
 		return "", fmt.Errorf("prepare candidate: %w", err)
 	}
@@ -241,9 +241,8 @@ func (e *Engine) removeOtherPrepared(keep string) {
 func preparedID(sha, digest string, cfg config.Config) string {
 	inputs := struct {
 		SHA, Digest, Setup string
-		Port               int
 		Env                []string
-	}{sha, digest, cfg.SetupCommand, cfg.ServicePort, cfg.AppEnv}
+	}{sha, digest, cfg.SetupCommand, cfg.AppEnv}
 	b, _ := json.Marshal(inputs)
 	h := sha256.Sum256(b)
 	return hex.EncodeToString(h[:])
@@ -281,7 +280,7 @@ func (e *Engine) recover(ctx, watchCtx context.Context, generation uint64, force
 	prepared := a.Prepared
 	if restarted {
 		e.removeInstancePath(filepath.Join(e.Cfg.DataDir, "runsc-root"), old.RootPath())
-		inst, err = e.Runtime.Restart(e.runtimeContext(watchCtx), id, old.BundlePath(), e.Cfg.RunCommand, e.Cfg.ServicePort, e.Cfg.AppEnv)
+		inst, err = e.Runtime.Restart(e.runtimeContext(watchCtx), id, old.BundlePath(), e.Cfg.RunCommand, e.Cfg.AppEnv)
 		log.Printf("restarting revision %s using existing writable installation", a.Revision)
 	} else {
 		var prepErr error
@@ -289,7 +288,7 @@ func (e *Engine) recover(ctx, watchCtx context.Context, generation uint64, force
 		if prepErr != nil {
 			return prepErr
 		}
-		inst, err = e.Runtime.Start(ctx, e.runtimeContext(watchCtx), id, prepared, e.Cfg.RunCommand, e.Cfg.ServicePort, e.Cfg.AppEnv)
+		inst, err = e.Runtime.Start(ctx, e.runtimeContext(watchCtx), id, prepared, e.Cfg.RunCommand, e.Cfg.AppEnv)
 		log.Printf("redeploying revision %s with fresh writable filesystem", a.Revision)
 	}
 	if err != nil {

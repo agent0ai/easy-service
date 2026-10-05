@@ -187,7 +187,7 @@ func ownedRuntime(data string, pid int) bool {
 		return false
 	}
 	exe, err := os.Readlink(filepath.Join(dir, "exe"))
-	if err != nil || filepath.Base(strings.TrimSuffix(exe, " (deleted)")) != "rootlesskit" {
+	if err != nil || filepath.Base(strings.TrimSuffix(exe, " (deleted)")) != "runsc" {
 		return false
 	}
 	b, err := os.ReadFile(filepath.Join(dir, "cmdline"))
@@ -195,17 +195,7 @@ func ownedRuntime(data string, pid int) bool {
 		return false
 	}
 	args := strings.Split(strings.TrimRight(string(b), "\x00"), "\x00")
-	if len(args) == 0 || filepath.Base(args[0]) != "rootlesskit" {
-		return false
-	}
-	runsc := -1
-	for n := 1; n+1 < len(args); n++ {
-		if args[n] == "--" && filepath.Base(args[n+1]) == "runsc" {
-			runsc = n + 1
-			break
-		}
-	}
-	if runsc < 0 {
+	if len(args) == 0 || filepath.Base(args[0]) != "runsc" {
 		return false
 	}
 	cwd, err := os.Readlink(filepath.Join(dir, "cwd"))
@@ -213,7 +203,7 @@ func ownedRuntime(data string, pid int) bool {
 		return false
 	}
 	var root, bundle string
-	for n := runsc + 1; n+1 < len(args); n++ {
+	for n := 1; n+1 < len(args); n++ {
 		value := args[n+1]
 		if !filepath.IsAbs(value) {
 			value = filepath.Join(cwd, value)

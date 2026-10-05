@@ -37,7 +37,7 @@ func TestControlActionsWithLocalGit(t *testing.T) {
 		t.Fatalf("git init: %s %v", out, err)
 	}
 	first := commitVersion(t, origin, "one")
-	cfg := config.Config{DataDir: t.TempDir(), GitURL: origin, GitToken: "supervisor-secret", RuntimeImage: "node:22-bookworm-slim", ServicePort: 80, UpdateMethod: "commit", GitBranch: "main", UpdatePattern: "*", PollInterval: time.Hour, StartupTimeout: 100 * time.Millisecond, HealthInterval: 10 * time.Millisecond, HealthFailures: 2}
+	cfg := config.Config{DataDir: t.TempDir(), GitURL: origin, GitToken: "supervisor-secret", RuntimeImage: "node:22-bookworm-slim", UpdateMethod: "commit", GitBranch: "main", UpdatePattern: "*", PollInterval: time.Hour, StartupTimeout: 100 * time.Millisecond, HealthInterval: 10 * time.Millisecond, HealthFailures: 2}
 	git := revision.New(origin, "", cfg.DataDir)
 	rt := &httpRuntime{Runtime: sandbox.Runtime{Data: cfg.DataDir}}
 	e := &Engine{Cfg: cfg, Runtime: rt, Checkout: git, Proxy: proxy.New(), Store: state.Store{Data: cfg.DataDir}, Health: health.New(cfg.HealthInterval, "/health"), Rootfs: t.TempDir(), Digest: "sha256:test", Drain: 500 * time.Millisecond, Failures: make(chan uint64, 1)}

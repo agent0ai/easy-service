@@ -20,7 +20,6 @@ services:
       SETUP_COMMAND: npm ci
       RUN_COMMAND: node server.js
     volumes: [easy-service-data:/data]
-    devices: [/dev/net/tun:/dev/net/tun]
     security_opt: [seccomp=unconfined]
 volumes:
   easy-service-data:
@@ -42,9 +41,9 @@ also use full registry names or pinned digests. `SETUP_COMMAND` installs your
 application's dependencies and can be omitted if none are needed.
 
 Commands run in `/app` using `/bin/sh`. Keep the server running in the foreground
-and make it listen on `$PORT` (80 by default). Pass application settings as
-`APP_NAME=value`; the application receives `NAME=value`. Git credentials stay
-in the supervisor.
+and make it listen on `$PORT`, assigned automatically for each instance. Pass
+application settings as `APP_NAME=value`; the application receives `NAME=value`.
+Git credentials stay in the supervisor.
 
 ## Inspect and control
 
@@ -77,7 +76,6 @@ All of these are optional. Times are in seconds.
 | `UPDATE_METHOD` | `commit` | Deploy by `commit`, `tag`, or GitHub `release`. |
 | `UPDATE_PATTERN` | `*` | Tag/release name filter, using `*` and `?`. |
 | `POLL_INTERVAL` | `300` | How often to check Git. |
-| `SERVICE_PORT` | `80` | Port your application listens on. Also passed as `PORT`. |
 | `HEALTH_PATH` | `/` | URL path that must return a 2xx response. |
 | `STARTUP_TIMEOUT` | `60` | How long to wait for a new service to become healthy after setup. |
 | `HEALTH_INTERVAL` | `10` | Time between health checks and recovery retries. |
@@ -107,10 +105,12 @@ Streaming uploads, streamed responses, SSE, and WebSockets are supported over
 HTTP/1.1. Use a trusted reverse proxy for HTTPS and client HTTP/2 or HTTP/3.
 Native HTTP/2 gRPC and forward-proxy CONNECT are unsupported.
 
-Use a Linux host with Docker 24+, kernel 5.15+, cgroup v2, unprivileged user
-namespaces, subordinate UID/GID mappings, and `/dev/net/tun`. Keep the Compose
-device and security settings shown above. Workloads run in rootless gVisor;
-startup fails if the host cannot provide it.
+Use a Linux host with Docker 24+, kernel 5.15+ and unprivileged user namespaces.
+Keep the Compose security setting shown above so nested gVisor can start.
+Workloads run directly in rootless gVisor and share the outer container's
+network. Each instance gets its own port, including during updates; gVisor
+isolates its processes and filesystem. No TUN device or subordinate UID/GID
+setup is required. Startup fails if the host cannot provide gVisor.
 
 ## Development
 
