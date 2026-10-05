@@ -11,6 +11,8 @@ import (
 	"runtime"
 	"strings"
 	"time"
+
+	"github.com/example/easy-service/internal/state"
 )
 
 type Runner interface {
@@ -23,6 +25,9 @@ type Manager struct {
 type Prepared struct{ Digest, Rootfs string }
 
 func (m Manager) Cached(ref, digest string) (Prepared, error) {
+	if !validDigest(digest) {
+		return Prepared{}, fmt.Errorf("cached image digest invalid")
+	}
 	h := sha256.Sum256([]byte(ref + "\x00" + digest + "\x00" + runtime.GOARCH))
 	dir := filepath.Join(m.Data, "images", hex.EncodeToString(h[:12]))
 	b, e := os.ReadFile(filepath.Join(dir, "ready.json"))
@@ -30,7 +35,7 @@ func (m Manager) Cached(ref, digest string) (Prepared, error) {
 		return Prepared{}, e
 	}
 	var p Prepared
-	if e = json.Unmarshal(b, &p); e != nil || p.Digest != digest {
+	if e = json.Unmarshal(b, &p); e != nil || p.Digest != digest || p.Rootfs != filepath.Join(dir, "bundle", "rootfs") {
 		return Prepared{}, fmt.Errorf("cached image metadata mismatch")
 	}
 	if st, e := os.Stat(p.Rootfs); e != nil || !st.IsDir() {
@@ -40,12 +45,12 @@ func (m Manager) Cached(ref, digest string) (Prepared, error) {
 }
 
 func (m Manager) Prepare(ctx context.Context, ref string) (Prepared, error) {
-	digest, e := m.Runner.Run(ctx, 10*time.Minute, "skopeo", "inspect", "--override-arch", runtime.GOARCH, "--format", "{{.Digest}}", "docker://"+ref)
+	digest, e := m.Runner.Run(ctx, 10*time.Minute, "skopeo", "inspect", "--no-tags", "--override-os", "linux", "--override-arch", runtime.GOARCH, "--format", "{{.Digest}}", "docker://"+ref)
 	if e != nil {
 		return Prepared{}, fmt.Errorf("resolve runtime image: %w", e)
 	}
 	digest = strings.TrimSpace(digest)
-	if !strings.HasPrefix(digest, "sha256:") {
+	if !validDigest(digest) {
 		return Prepared{}, fmt.Errorf("registry returned invalid digest")
 	}
 	if at := strings.LastIndex(ref, "@sha256:"); at >= 0 && ref[at+1:] != digest {
@@ -55,13 +60,8 @@ func (m Manager) Prepare(ctx context.Context, ref string) (Prepared, error) {
 	dir := filepath.Join(m.Data, "images", hex.EncodeToString(h[:12]))
 	root := filepath.Join(dir, "bundle", "rootfs")
 	meta := filepath.Join(dir, "ready.json")
-	if b, e := os.ReadFile(meta); e == nil {
-		var p Prepared
-		if json.Unmarshal(b, &p) == nil && p.Digest == digest {
-			if st, e := os.Stat(p.Rootfs); e == nil && st.IsDir() {
-				return p, nil
-			}
-		}
+	if p, e := m.Cached(ref, digest); e == nil {
+		return p, nil
 	}
 	if e := os.RemoveAll(dir); e != nil {
 		return Prepared{}, e
@@ -75,42 +75,39 @@ func (m Manager) Prepare(ctx context.Context, ref string) (Prepared, error) {
 	if at := strings.LastIndexByte(immutable, '@'); at >= 0 {
 		immutable = immutable[:at]
 	}
+	if at := strings.LastIndexByte(immutable, ':'); at > strings.LastIndexByte(immutable, '/') {
+		immutable = immutable[:at] // preserve registry ports, remove image tags
+	}
 	immutable += "@" + digest
-	if _, e = m.Runner.Run(ctx, 10*time.Minute, "skopeo", "copy", "--override-arch", runtime.GOARCH, "docker://"+immutable, "oci:"+layout+":runtime"); e != nil {
+	copiedDigestFile := filepath.Join(dir, "copied-digest")
+	if _, e = m.Runner.Run(ctx, 10*time.Minute, "skopeo", "copy", "--digestfile", copiedDigestFile, "--override-os", "linux", "--override-arch", runtime.GOARCH, "docker://"+immutable, "oci:"+layout+":runtime"); e != nil {
 		os.RemoveAll(dir)
 		return Prepared{}, fmt.Errorf("pull runtime image: %w", e)
 	}
 	copied, inspectErr := m.Runner.Run(ctx, 10*time.Minute, "skopeo", "inspect", "--format", "{{.Digest}}", "oci:"+layout+":runtime")
-	if inspectErr != nil || strings.TrimSpace(copied) != digest {
+	// The source may be a multi-platform index or converted to OCI. Skopeo
+	// records the copied manifest's digest; it need not equal the source index.
+	expected, digestErr := os.ReadFile(copiedDigestFile)
+	if inspectErr != nil || digestErr != nil || !validDigest(strings.TrimSpace(string(expected))) || strings.TrimSpace(copied) != strings.TrimSpace(string(expected)) {
 		os.RemoveAll(dir)
 		return Prepared{}, fmt.Errorf("copied runtime image digest verification failed")
 	}
-	if _, e = m.Runner.Run(ctx, 10*time.Minute, "umoci", "unpack", "--image", layout+":runtime", bundle); e != nil {
+	if _, e = m.Runner.Run(ctx, 10*time.Minute, "umoci", "unpack", "--rootless", "--image", layout+":runtime", bundle); e != nil {
 		os.RemoveAll(dir)
 		return Prepared{}, fmt.Errorf("unpack runtime image: %w", e)
 	}
 	p := Prepared{digest, root}
 	b, _ := json.Marshal(p)
-	if e := atomicWrite(meta, b); e != nil {
+	if e := state.AtomicWrite(meta, b); e != nil {
 		return Prepared{}, e
 	}
 	return p, nil
 }
-func atomicWrite(path string, b []byte) error {
-	tmp := path + ".tmp"
-	if e := os.WriteFile(tmp, b, 0600); e != nil {
-		return e
+
+func validDigest(digest string) bool {
+	if !strings.HasPrefix(digest, "sha256:") || len(digest) != 71 {
+		return false
 	}
-	if e := os.Rename(tmp, path); e != nil {
-		return e
-	}
-	return syncDir(filepath.Dir(path))
-}
-func syncDir(path string) error {
-	d, e := os.Open(path)
-	if e != nil {
-		return e
-	}
-	defer d.Close()
-	return d.Sync()
+	_, err := hex.DecodeString(digest[7:])
+	return err == nil
 }

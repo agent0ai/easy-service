@@ -6,10 +6,10 @@ services:
       - "8080:80"
     environment:
       GIT_URL: https://github.com/example/stateless-api.git
-      RUNTIME_IMAGE: docker.io/library/node:22-bookworm-slim
+      GIT_TOKEN: ${GIT_TOKEN:-}
+      RUNTIME_IMAGE: node:22-bookworm-slim
+      SETUP_COMMAND: npm ci
       RUN_COMMAND: node server.js
-      SERVICE_PORT: "80"
-      SERVICE_MEMORY_LIMIT: 512M
     volumes:
       - easy-service-data:/data
     devices:

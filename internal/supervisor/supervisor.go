@@ -2,13 +2,15 @@ package supervisor
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"log"
 	"net"
 	"net/http"
 	"os"
 	"path/filepath"
-	"strings"
 	"sync"
 	"time"
 
@@ -26,13 +28,13 @@ type Instance interface {
 	Endpoint() string
 	BundlePath() string
 	RootPath() string
-	PID() int
 	MemoryUsage() (uint64, error)
 }
 type Runtime interface {
 	Prepare(context.Context, string, string, string, string, int, []string) (string, error)
 	ValidatePrepared(string) error
-	Start(context.Context, string, string, string, int, []string) (Instance, error)
+	// Start separates filesystem-operation cancellation from process lifetime.
+	Start(context.Context, context.Context, string, string, string, int, []string) (Instance, error)
 	Restart(context.Context, string, string, string, int, []string) (Instance, error)
 }
 type Checkout interface {
@@ -48,6 +50,8 @@ type Active struct {
 	Backend                    *proxy.Backend
 	Restarted                  bool
 	generation                 uint64
+	cancelWatch                context.CancelFunc
+	failed                     chan struct{}
 }
 type Engine struct {
 	Cfg            config.Config
@@ -96,19 +100,37 @@ func (e *Engine) Replace(ctx context.Context, generation uint64) error {
 	if a == nil || a.generation != generation {
 		return nil
 	}
-	replaceCtx, cancel := context.WithCancel(ctx)
-	defer cancel()
-	go func() {
-		select {
-		case <-a.Instance.Done():
-			cancel()
-		case <-replaceCtx.Done():
-		}
-	}()
-	return e.deploy(replaceCtx, ctx, revision.Selection{SHA: a.Revision, Name: "memory replacement"}, &generation)
+	if a.Instance.Exited() {
+		return fmt.Errorf("active deployment exited before replacement")
+	}
+	return e.deploy(ctx, ctx, revision.Selection{SHA: a.Revision, Name: "memory replacement"}, &generation)
 }
 
 func (e *Engine) deploy(ctx, watchCtx context.Context, sel revision.Selection, expected *uint64) error {
+	if !revision.ValidSHA(sel.SHA) {
+		return fmt.Errorf("refusing non-exact deployment SHA")
+	}
+	e.mu.Lock()
+	previous := e.active
+	serving := previous != nil && e.Proxy.Current() == previous.Backend && !previous.Instance.Exited()
+	e.mu.Unlock()
+	if serving {
+		opCtx, cancel := context.WithCancel(ctx)
+		defer cancel()
+		ctx = opCtx
+		go func() {
+			select {
+			case <-previous.Instance.Done():
+				cancel()
+			case <-previous.failed:
+				cancel()
+			case <-opCtx.Done():
+			}
+		}()
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	id := e.nextID(sel.SHA)
 	prepared, err := e.ensurePrepared(ctx, sel.SHA, id)
 	if err != nil {
@@ -117,7 +139,7 @@ func (e *Engine) deploy(ctx, watchCtx context.Context, sel revision.Selection, e
 	// Runtime.Start binds the sandbox process lifetime to its context. Operations
 	// and health watches may be cancelled before graceful proxy drain completes,
 	// so active processes use the engine-owned runtime context instead.
-	candidate, err := e.Runtime.Start(e.runtimeContext(watchCtx), id, prepared, e.Cfg.RunCommand, e.Cfg.ServicePort, e.Cfg.AppEnv)
+	candidate, err := e.Runtime.Start(ctx, e.runtimeContext(watchCtx), id, prepared, e.Cfg.RunCommand, e.Cfg.ServicePort, e.Cfg.AppEnv)
 	if err != nil {
 		e.invalidatePrepared(prepared)
 		return fmt.Errorf("start candidate: %w", err)
@@ -126,31 +148,13 @@ func (e *Engine) deploy(ctx, watchCtx context.Context, sel revision.Selection, e
 		e.cleanup(candidate, true)
 		return fmt.Errorf("candidate rejected: %w", err)
 	}
-	backend, err := proxy.NewBackend(candidate.Endpoint())
+	a := &Active{Revision: sel.SHA, Digest: e.Digest, Prepared: prepared, Instance: candidate}
+	old, err := e.publish(ctx, watchCtx, a, expected)
 	if err != nil {
 		e.cleanup(candidate, true)
 		return err
 	}
-	e.mu.Lock()
-	old := e.active
-	if expected != nil && (old == nil || old.generation != *expected || old.Instance.Exited() || ctx.Err() != nil) {
-		e.mu.Unlock()
-		e.cleanup(candidate, true)
-		return fmt.Errorf("active deployment failed during replacement")
-	}
-	e.seq++
-	a := &Active{sel.SHA, e.Digest, prepared, candidate, backend, false, e.seq}
-	e.active = a
-	if err = e.Store.Save(state.State{Revision: sel.SHA, Digest: e.Digest, ImageRef: e.Cfg.RuntimeImage, Prepared: prepared, Bundle: candidate.BundlePath(), PID: candidate.PID()}); err != nil {
-		e.active = old
-		e.mu.Unlock()
-		e.cleanup(candidate, true)
-		return err
-	}
-	e.Proxy.Set(backend)
-	e.mu.Unlock()
 	log.Printf("cut over to revision %s", sel.SHA)
-	e.watch(watchCtx, a)
 	if old != nil {
 		// Once routing has changed, retiring the old backend is committed
 		// lifecycle work. The operation context may be cancelled by SIGTERM,
@@ -166,8 +170,34 @@ func (e *Engine) deploy(ctx, watchCtx context.Context, sel revision.Selection, e
 	e.removeOtherPrepared(prepared)
 	return nil
 }
+
+func (e *Engine) publish(ctx, watchCtx context.Context, a *Active, expected *uint64) (*Active, error) {
+	backend, err := proxy.NewBackend(a.Instance.Endpoint())
+	if err != nil {
+		return nil, err
+	}
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	old := e.active
+	if ctx.Err() != nil || a.Instance.Exited() || (expected != nil && (old == nil || old.generation != *expected || old.Instance.Exited())) {
+		return nil, fmt.Errorf("candidate cancelled or deployment exited before cutover")
+	}
+	e.seq++
+	a.Backend, a.generation = backend, e.seq
+	if err = e.Store.Save(state.State{Revision: a.Revision, Digest: a.Digest, GitURL: e.Cfg.GitURL, ImageRef: e.Cfg.RuntimeImage}); err != nil {
+		return nil, err
+	}
+	e.active = a
+	e.Proxy.Set(backend)
+	e.watch(watchCtx, a)
+	if old != nil && old.cancelWatch != nil {
+		old.cancelWatch()
+	}
+	return old, nil
+}
+
 func (e *Engine) ensurePrepared(ctx context.Context, sha, id string) (string, error) {
-	prepID := preparedID(sha, e.Digest)
+	prepID := preparedID(sha, e.Digest, e.Cfg)
 	prepared := filepath.Join(e.Cfg.DataDir, "prepared", prepID)
 	if e.Runtime.ValidatePrepared(prepared) == nil {
 		return prepared, nil
@@ -191,7 +221,7 @@ func (e *Engine) ensurePrepared(ctx context.Context, sha, id string) (string, er
 }
 func (e *Engine) invalidatePrepared(path string) {
 	root := filepath.Join(e.Cfg.DataDir, "prepared")
-	if within(root, path) {
+	if state.Within(root, path) {
 		_ = os.RemoveAll(path)
 	}
 }
@@ -203,41 +233,55 @@ func (e *Engine) removeOtherPrepared(keep string) {
 	}
 	for _, entry := range entries {
 		path := filepath.Join(root, entry.Name())
-		if path != keep && within(root, path) {
+		if path != keep && state.Within(root, path) {
 			_ = os.RemoveAll(path)
 		}
 	}
 }
-func preparedID(sha, digest string) string {
-	if len(sha) > 16 {
-		sha = sha[:16]
-	}
-	digest = strings.TrimPrefix(digest, "sha256:")
-	if len(digest) > 12 {
-		digest = digest[:12]
-	}
-	return sha + "-" + digest
+func preparedID(sha, digest string, cfg config.Config) string {
+	inputs := struct {
+		SHA, Digest, Setup string
+		Port               int
+		Env                []string
+	}{sha, digest, cfg.SetupCommand, cfg.ServicePort, cfg.AppEnv}
+	b, _ := json.Marshal(inputs)
+	h := sha256.Sum256(b)
+	return hex.EncodeToString(h[:])
 }
 func (e *Engine) Recover(ctx context.Context, generation uint64) error {
+	return e.recover(ctx, ctx, generation, false)
+}
+
+func (e *Engine) recover(ctx, watchCtx context.Context, generation uint64, forceRestart bool) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	e.mu.Lock()
-	defer e.mu.Unlock()
 	a := e.active
 	if a == nil || a.generation != generation {
+		e.mu.Unlock()
 		return nil
 	}
 	e.Proxy.Set(nil)
+	if a.cancelWatch != nil {
+		a.cancelWatch()
+	}
+	restarted := forceRestart || !a.Restarted
+	e.mu.Unlock()
 	old := a.Instance
-	stop(old)
+	if err := stop(old); err != nil {
+		return err
+	}
+	e.mu.Lock()
+	a.Restarted = true
+	e.mu.Unlock()
 	id := e.nextID(a.Revision)
 	var inst Instance
 	var err error
-	restarted := false
 	prepared := a.Prepared
-	if !a.Restarted {
-		a.Restarted = true
-		restarted = true
+	if restarted {
 		e.removeInstancePath(filepath.Join(e.Cfg.DataDir, "runsc-root"), old.RootPath())
-		inst, err = e.Runtime.Restart(e.runtimeContext(ctx), id, old.BundlePath(), e.Cfg.RunCommand, e.Cfg.ServicePort, e.Cfg.AppEnv)
+		inst, err = e.Runtime.Restart(e.runtimeContext(watchCtx), id, old.BundlePath(), e.Cfg.RunCommand, e.Cfg.ServicePort, e.Cfg.AppEnv)
 		log.Printf("restarting revision %s using existing writable installation", a.Revision)
 	} else {
 		var prepErr error
@@ -245,7 +289,7 @@ func (e *Engine) Recover(ctx context.Context, generation uint64) error {
 		if prepErr != nil {
 			return prepErr
 		}
-		inst, err = e.Runtime.Start(e.runtimeContext(ctx), id, prepared, e.Cfg.RunCommand, e.Cfg.ServicePort, e.Cfg.AppEnv)
+		inst, err = e.Runtime.Start(ctx, e.runtimeContext(watchCtx), id, prepared, e.Cfg.RunCommand, e.Cfg.ServicePort, e.Cfg.AppEnv)
 		log.Printf("redeploying revision %s with fresh writable filesystem", a.Revision)
 	}
 	if err != nil {
@@ -258,32 +302,25 @@ func (e *Engine) Recover(ctx context.Context, generation uint64) error {
 		e.cleanup(inst, !restarted)
 		return err
 	}
-	b, err := proxy.NewBackend(inst.Endpoint())
-	if err != nil {
+	replacement := &Active{Revision: a.Revision, Digest: a.Digest, Prepared: prepared, Instance: inst, Restarted: restarted}
+	if _, err = e.publish(ctx, watchCtx, replacement, nil); err != nil {
 		e.cleanup(inst, !restarted)
 		return err
 	}
-	e.seq++
-	replacement := &Active{Revision: a.Revision, Digest: a.Digest, Prepared: prepared, Instance: inst, Backend: b, Restarted: restarted, generation: e.seq}
-	if err = e.Store.Save(state.State{Revision: replacement.Revision, Digest: replacement.Digest, ImageRef: e.Cfg.RuntimeImage, Prepared: replacement.Prepared, Bundle: inst.BundlePath(), PID: inst.PID()}); err != nil {
-		e.cleanup(inst, !restarted)
-		return err
-	}
-	e.active = replacement
-	e.Proxy.Set(b)
-	e.watch(ctx, replacement)
 	if !restarted {
 		e.cleanup(old, true)
 	}
 	e.removeOtherPrepared(replacement.Prepared)
 	return nil
 }
-func (e *Engine) MarkUnhealthy(generation uint64) {
+func (e *Engine) MarkUnhealthy(generation uint64) bool {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	if e.active != nil && e.active.generation == generation {
 		e.Proxy.Set(nil)
+		return true
 	}
+	return false
 }
 func (e *Engine) Selected() string {
 	e.mu.Lock()
@@ -294,12 +331,18 @@ func (e *Engine) Selected() string {
 	return e.active.Revision
 }
 func (e *Engine) watch(ctx context.Context, a *Active) {
+	ctx, a.cancelWatch = context.WithCancel(ctx)
+	a.failed = make(chan struct{})
 	instance, endpoint, generation := a.Instance, a.Instance.Endpoint(), a.generation
 	go func() {
 		r := e.Health.UntilFailure(ctx, endpoint, instance, e.Cfg.HealthFailures)
 		if ctx.Err() == nil && r != health.Healthy {
+			close(a.failed)
 			e.MarkUnhealthy(generation)
-			e.Failures <- generation
+			select {
+			case e.Failures <- generation:
+			case <-ctx.Done():
+			}
 		}
 	}()
 	if e.Cfg.ServiceMemoryLimit > 0 && e.MemoryExceeded != nil {
@@ -340,45 +383,45 @@ func (e *Engine) Shutdown(ctx context.Context) {
 	e.active = nil
 	if a != nil {
 		e.Proxy.Set(nil)
+		if a.cancelWatch != nil {
+			a.cancelWatch()
+		}
 	}
 	e.mu.Unlock()
 	if a != nil {
 		drained := a.Backend.Drain(ctx, e.Drain)
 		log.Printf("active deployment shutdown drain complete=%t", drained)
-		stopContext(ctx, a.Instance)
+		if err := stopContext(ctx, a.Instance); err != nil {
+			log.Printf("sandbox shutdown failed: %v", err)
+		}
 	}
 }
-func stop(i Instance) {
+func stop(i Instance) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	_ = i.Stop(ctx)
+	return stopContext(ctx, i)
 }
-func stopContext(ctx context.Context, i Instance) { _ = i.Stop(ctx) }
+func stopContext(ctx context.Context, i Instance) error {
+	err := i.Stop(ctx)
+	if !i.Exited() {
+		return fmt.Errorf("sandbox is still running after stop: %v", err)
+	}
+	return nil
+}
 func (e *Engine) cleanup(i Instance, bundle bool) {
-	stop(i)
+	if err := stop(i); err != nil {
+		log.Printf("sandbox cleanup deferred: %v", err)
+		return
+	}
 	e.removeInstancePath(filepath.Join(e.Cfg.DataDir, "runsc-root"), i.RootPath())
 	if bundle {
 		e.removeInstancePath(filepath.Join(e.Cfg.DataDir, "instances"), i.BundlePath())
 	}
 }
 func (e *Engine) removeInstancePath(root, path string) {
-	if within(root, path) {
+	if state.Within(root, path) {
 		_ = os.RemoveAll(path)
 	}
-}
-func within(root, path string) bool {
-	r, err := filepath.Abs(root)
-	if err != nil {
-		return false
-	}
-	p, err := filepath.Abs(path)
-	return err == nil && p != r && strings.HasPrefix(p, r+string(filepath.Separator))
-}
-func backendOf(a *Active) *proxy.Backend {
-	if a == nil {
-		return nil
-	}
-	return a.Backend
 }
 
 type Selector interface {
@@ -389,37 +432,85 @@ type Controller struct {
 	Selector Selector
 	Engine   *Engine
 	Initial  *revision.Selection
+	commands chan command
 }
 
 func (c *Controller) Run(ctx context.Context) {
 	updates := make(chan revision.Selection, 1)
-	go c.poll(ctx, updates)
+	refresh := make(chan selectionRequest)
+	go c.poll(ctx, updates, refresh)
 	selected := c.Engine.Selected()
 	pending := c.Initial
+	pendingFailed := false
 	var recovery *uint64
 	var retry <-chan time.Time
-	if pending != nil {
-		retry = time.After(0)
+	retryTimer := time.NewTimer(time.Hour)
+	retryTimer.Stop()
+	defer retryTimer.Stop()
+	scheduleRetry := func(delay time.Duration) {
+		if !retryTimer.Stop() {
+			select {
+			case <-retryTimer.C:
+			default:
+			}
+		}
+		retryTimer.Reset(delay)
+		retry = retryTimer.C
 	}
-	acceptUpdate := func(s revision.Selection) {
+	if pending != nil {
+		scheduleRetry(0)
+	}
+	acceptUpdate := func(s revision.Selection) bool {
 		if s.SHA == selected {
 			// The newest selection owns desired state even when it moves back to
 			// the active revision. Cancel any older failed candidate.
+			changed := pending != nil
 			pending = nil
-			return
+			pendingFailed = false
+			return changed
+		}
+		if pending != nil && pending.SHA == s.SHA {
+			return false
 		}
 		pending = &s
+		pendingFailed = false
+		return true
 	}
 	for {
 		attempt := false
 		select {
 		case <-ctx.Done():
 			return
+		case request := <-c.commands:
+			op, cancel := context.WithCancel(ctx)
+			stopCancel := context.AfterFunc(request.ctx, cancel)
+			if request.ctx.Err() != nil {
+				cancel()
+			}
+			sha, err := c.execute(op, ctx, request.action, refresh, updates)
+			stopCancel()
+			cancel()
+			if err == nil {
+				recovery = nil
+				if sha != "" {
+					selected, pending, pendingFailed = sha, nil, false
+					retryTimer.Stop()
+					retry = nil
+				}
+			} else if c.Engine.Proxy.Current() == nil {
+				if generation := c.Engine.activeGeneration(); generation != 0 {
+					recovery = &generation
+					scheduleRetry(c.Cfg.HealthInterval)
+				}
+			}
+			request.result <- err
+			continue
 		case s := <-updates:
-			acceptUpdate(s)
-			attempt = true
+			attempt = acceptUpdate(s)
 		case gen := <-c.Engine.Failures:
-			c.Engine.MarkUnhealthy(gen)
+			if !c.Engine.MarkUnhealthy(gen) {
+				continue
+			}
 			recovery = &gen
 			attempt = true
 		case gen := <-c.Engine.MemoryExceeded:
@@ -444,27 +535,42 @@ func (c *Controller) Run(ctx context.Context) {
 			}
 		}
 	drained:
+		// A candidate that already failed must not block recovery of the serving
+		// revision. A genuinely newer selection still gets the first attempt.
+		if recovery != nil && (pending == nil || pendingFailed) {
+			if err := c.Engine.Recover(ctx, *recovery); err != nil {
+				log.Printf("recovery failed; retrying after health interval: %v", err)
+				scheduleRetry(c.Cfg.HealthInterval)
+				continue
+			}
+			recovery = nil
+			if pending != nil {
+				scheduleRetry(c.Cfg.HealthInterval)
+			}
+			continue
+		}
 		if pending != nil {
 			s := *pending
 			if err := c.Engine.Deploy(ctx, s); err != nil {
+				pendingFailed = true
 				log.Printf("deployment %s failed; retrying after health interval: %v", s.SHA, err)
-				retry = time.After(c.Cfg.HealthInterval)
+				scheduleRetry(c.Cfg.HealthInterval)
+			} else {
+				selected, pending, recovery = s.SHA, nil, nil
 				continue
 			}
-			selected, pending, recovery = s.SHA, nil, nil
-			continue
 		}
 		if recovery != nil {
 			if err := c.Engine.Recover(ctx, *recovery); err != nil {
 				log.Printf("recovery failed; retrying after health interval: %v", err)
-				retry = time.After(c.Cfg.HealthInterval)
+				scheduleRetry(c.Cfg.HealthInterval)
 				continue
 			}
 			recovery = nil
 		}
 	}
 }
-func (c *Controller) poll(ctx context.Context, out chan revision.Selection) {
+func (c *Controller) poll(ctx context.Context, out chan revision.Selection, refresh <-chan selectionRequest) {
 	check := func() {
 		x, e := c.Selector.Select(ctx, c.Cfg.UpdateMethod, c.Cfg.GitBranch, c.Cfg.UpdatePattern)
 		if e != nil {
@@ -474,8 +580,14 @@ func (c *Controller) poll(ctx context.Context, out chan revision.Selection) {
 		select {
 		case out <- x:
 		default:
-			<-out
-			out <- x
+			select {
+			case <-out:
+			default:
+			}
+			select {
+			case out <- x:
+			case <-ctx.Done():
+			}
 		}
 	}
 	check()
@@ -487,6 +599,9 @@ func (c *Controller) poll(ctx context.Context, out chan revision.Selection) {
 			return
 		case <-t.C:
 			check()
+		case request := <-refresh:
+			s, err := c.Selector.Select(request.ctx, c.Cfg.UpdateMethod, c.Cfg.GitBranch, c.Cfg.UpdatePattern)
+			request.result <- selectionResult{s, err}
 		}
 	}
 }

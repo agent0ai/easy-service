@@ -1,7 +1,7 @@
 package config
 
 import (
-	"os"
+	"path/filepath"
 	"testing"
 )
 
@@ -10,6 +10,20 @@ func validEnvironment(t *testing.T) {
 	t.Setenv("GIT_URL", "https://github.com/acme/api.git")
 	t.Setenv("RUNTIME_IMAGE", "alpine@sha256:abc")
 	t.Setenv("RUN_COMMAND", "serve")
+}
+
+func TestDefaultRuntimeImage(t *testing.T) {
+	validEnvironment(t)
+	t.Setenv("RUNTIME_IMAGE", "")
+	c, err := Load()
+	if err != nil || c.RuntimeImage != "debian:bookworm-slim" {
+		t.Fatalf("default runtime image=%q err=%v", c.RuntimeImage, err)
+	}
+	t.Setenv("RUNTIME_IMAGE", "node:22-bookworm-slim")
+	c, err = Load()
+	if err != nil || c.RuntimeImage != "node:22-bookworm-slim" {
+		t.Fatalf("shorthand runtime image=%q err=%v", c.RuntimeImage, err)
+	}
 }
 
 func TestLoadAndEnvironmentIsolation(t *testing.T) {
@@ -63,12 +77,41 @@ func TestServiceMemoryLimitSemantics(t *testing.T) {
 }
 func TestInvalid(t *testing.T) {
 	for _, tc := range []struct{ k, v string }{{"GIT_URL", "http://github.com/a/b"}, {"GIT_URL", "https://x:y@github.com/a/b"}} {
-		os.Clearenv()
+		validEnvironment(t)
 		t.Setenv("RUNTIME_IMAGE", "x")
 		t.Setenv("RUN_COMMAND", "x")
 		t.Setenv(tc.k, tc.v)
 		if _, e := Load(); e == nil {
 			t.Fatalf("accepted %s", tc.v)
+		}
+	}
+}
+
+func TestLocalRepositoryConfiguration(t *testing.T) {
+	validEnvironment(t)
+	path := t.TempDir()
+	t.Setenv("GIT_URL", path)
+	c, err := Load()
+	if err != nil || c.GitURL != path {
+		t.Fatalf("local path rejected: url=%q err=%v", c.GitURL, err)
+	}
+	t.Setenv("UPDATE_METHOD", "release")
+	if _, err := Load(); err == nil {
+		t.Fatal("local repository accepted GitHub release mode")
+	}
+	t.Setenv("UPDATE_METHOD", "commit")
+	t.Setenv("GIT_URL", filepath.Join(path, "missing"))
+	if _, err := Load(); err == nil {
+		t.Fatal("missing local repository accepted")
+	}
+}
+
+func TestDurationMustFitPositiveNanoseconds(t *testing.T) {
+	validEnvironment(t)
+	for _, value := range []string{"0.0000000001", "9223372036.854776", "NaN", "Inf", "-1"} {
+		t.Setenv("POLL_INTERVAL", value)
+		if _, err := Load(); err == nil {
+			t.Fatalf("accepted duration that cannot drive a ticker: %q", value)
 		}
 	}
 }

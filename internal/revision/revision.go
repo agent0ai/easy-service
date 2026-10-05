@@ -3,23 +3,35 @@ package revision
 import (
 	"context"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
-	"sort"
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/example/easy-service/internal/process"
 )
 
 type Selection struct {
 	SHA, Name string
 	Time      time.Time
 }
+
+func ValidSHA(sha string) bool {
+	if len(sha) != 40 || sha != strings.ToLower(sha) {
+		return false
+	}
+	_, err := hex.DecodeString(sha)
+	return err == nil
+}
+
 type Manager struct {
 	URL, Token, Mirror string
 	Client             *http.Client
@@ -27,40 +39,61 @@ type Manager struct {
 }
 
 func New(raw, token, data string) *Manager {
-	m := &Manager{URL: raw, Token: token, Mirror: filepath.Join(data, "git-mirror"), Client: &http.Client{Timeout: 30 * time.Second}}
+	m := &Manager{URL: raw, Token: token, Mirror: filepath.Join(data, "git-mirror"), Client: &http.Client{Timeout: 30 * time.Second, CheckRedirect: func(req *http.Request, via []*http.Request) error {
+		if len(via) >= 10 || req.URL.Scheme != "https" || req.URL.Host != "api.github.com" {
+			return fmt.Errorf("refusing unsafe GitHub API redirect")
+		}
+		return nil
+	}}}
 	m.Run = m.run
 	return m
 }
 func (m *Manager) gitEnv(cmd *exec.Cmd) {
 	cmd.Env = []string{"PATH=" + os.Getenv("PATH"), "HOME=/nonexistent", "GIT_TERMINAL_PROMPT=0", "GIT_CONFIG_NOSYSTEM=1"}
-	if m.Token != "" {
+	if !filepath.IsAbs(m.URL) && m.Token != "" {
 		a := base64.StdEncoding.EncodeToString([]byte("x-access-token:" + m.Token))
 		cmd.Env = append(cmd.Env, "GIT_CONFIG_COUNT=1", "GIT_CONFIG_KEY_0=http.extraHeader", "GIT_CONFIG_VALUE_0=Authorization: Basic "+a)
 	}
 }
 func (m *Manager) run(ctx context.Context, dir string, args ...string) (string, error) {
-	c := exec.CommandContext(ctx, "git", args...)
+	c := process.Command(ctx, "git", args...)
 	c.Dir = dir
 	m.gitEnv(c)
-	b, e := c.CombinedOutput()
+	b, e := process.Output(c)
 	if e != nil {
-		return "", fmt.Errorf("git operation failed: %w: %s", e, strings.TrimSpace(string(b)))
+		if m.Token != "" {
+			b = strings.ReplaceAll(b, m.Token, "[redacted]")
+			b = strings.ReplaceAll(b, base64.StdEncoding.EncodeToString([]byte("x-access-token:"+m.Token)), "[redacted]")
+		}
+		return "", fmt.Errorf("git operation failed: %w: %s", e, strings.TrimSpace(b))
 	}
-	return strings.TrimSpace(string(b)), nil
+	return strings.TrimSpace(b), nil
 }
 func (m *Manager) Fetch(ctx context.Context) error {
-	if _, e := os.Stat(m.Mirror); os.IsNotExist(e) {
+	if _, e := os.Stat(filepath.Join(m.Mirror, "HEAD")); os.IsNotExist(e) {
 		if e := os.MkdirAll(filepath.Dir(m.Mirror), 0700); e != nil {
 			return e
 		}
 		if _, e = m.Run(ctx, "", "init", "--bare", m.Mirror); e != nil {
 			return e
 		}
-		if _, e = m.Run(ctx, m.Mirror, "remote", "add", "origin", m.URL); e != nil {
-			return e
-		}
+	} else if e != nil {
+		return e
 	}
-	_, e := m.Run(ctx, m.Mirror, "fetch", "--prune", "--force", "origin", "+refs/heads/*:refs/remotes/origin/*", "+refs/tags/*:refs/tags/*")
+	// Also repairs an interrupted remote setup and follows configuration changes.
+	if _, e := m.Run(ctx, m.Mirror, "config", "remote.origin.url", m.URL); e != nil {
+		return e
+	}
+	args := []string{"fetch", "--prune", "--force"}
+	if filepath.IsAbs(m.URL) {
+		// Git strips command-scope configuration before starting upload-pack.
+		// Explicit local sources may be mounted from a different UID; pass
+		// exact trust to that helper, never to unrelated repositories.
+		quote := func(s string) string { return "'" + strings.ReplaceAll(s, "'", "'\\''") + "'" }
+		args = append(args, "--upload-pack=git -c "+quote("safe.directory="+m.URL)+" -c "+quote("safe.directory="+filepath.Join(m.URL, ".git"))+" upload-pack")
+	}
+	args = append(args, "origin", "+refs/heads/*:refs/remotes/origin/*", "+refs/tags/*:refs/tags/*")
+	_, e := m.Run(ctx, m.Mirror, args...)
 	return e
 }
 func (m *Manager) Select(ctx context.Context, method, branch, pattern string) (Selection, error) {
@@ -104,37 +137,23 @@ func Match(pattern, name string) bool { // whole-string wildcard
 	return pi == len(pattern)
 }
 func (m *Manager) tag(ctx context.Context, p string) (Selection, error) {
-	out, e := m.Run(ctx, m.Mirror, "for-each-ref", "--format=%(refname:strip=2)%09%(creatordate:unix)%09%(*objectname)%09%(objectname)", "refs/tags")
+	out, e := m.Run(ctx, m.Mirror, "for-each-ref", "--sort=-refname", "--sort=-creatordate", "--format=%(refname:strip=2)%09%(creatordate:unix)", "refs/tags")
 	if e != nil {
 		return Selection{}, e
 	}
-	var xs []Selection
 	for _, l := range strings.Split(out, "\n") {
 		f := strings.Split(l, "\t")
-		if len(f) != 4 || !Match(p, f[0]) {
+		if len(f) != 2 || !Match(p, f[0]) {
 			continue
 		}
 		ts, _ := strconv.ParseInt(f[1], 10, 64)
-		sha := f[2]
-		if sha == "" {
-			sha = f[3]
-		}
-		resolved, e := m.Run(ctx, m.Mirror, "rev-parse", sha+"^{commit}")
+		resolved, e := m.Run(ctx, m.Mirror, "rev-parse", "refs/tags/"+f[0]+"^{commit}")
 		if e != nil {
 			continue
 		}
-		xs = append(xs, Selection{resolved, f[0], time.Unix(ts, 0)})
+		return Selection{resolved, f[0], time.Unix(ts, 0)}, nil
 	}
-	if len(xs) == 0 {
-		return Selection{}, fmt.Errorf("no matching tags")
-	}
-	sort.Slice(xs, func(i, j int) bool {
-		if xs[i].Time.Equal(xs[j].Time) {
-			return xs[i].Name > xs[j].Name
-		}
-		return xs[i].Time.After(xs[j].Time)
-	})
-	return xs[0], nil
+	return Selection{}, fmt.Errorf("no matching tags")
 }
 
 type release struct {
@@ -144,15 +163,26 @@ type release struct {
 }
 
 func (m *Manager) release(ctx context.Context, p string) (Selection, error) {
-	u, _ := url.Parse(m.URL)
+	u, err := url.Parse(m.URL)
+	if err != nil || u.Scheme != "https" || u.Host != "github.com" || u.User != nil {
+		return Selection{}, fmt.Errorf("release mode requires a GitHub repository")
+	}
 	parts := strings.Split(strings.TrimSuffix(strings.TrimPrefix(u.Path, "/"), ".git"), "/")
 	if len(parts) != 2 {
 		return Selection{}, fmt.Errorf("repository URL must identify owner/repo")
 	}
 	next := "https://api.github.com/repos/" + parts[0] + "/" + parts[1] + "/releases?per_page=100"
-	var xs []release
+	var best *release
+	seen := make(map[string]bool)
 	for next != "" {
-		req, _ := http.NewRequestWithContext(ctx, "GET", next, nil)
+		if seen[next] {
+			return Selection{}, fmt.Errorf("GitHub release pagination repeated a page")
+		}
+		seen[next] = true
+		req, err := http.NewRequestWithContext(ctx, "GET", next, nil)
+		if err != nil || req.URL.Scheme != "https" || req.URL.Host != "api.github.com" || req.URL.User != nil {
+			return Selection{}, fmt.Errorf("invalid GitHub release pagination URL")
+		}
 		req.Header.Set("Accept", "application/vnd.github+json")
 		req.Header.Set("X-GitHub-Api-Version", "2022-11-28")
 		if m.Token != "" {
@@ -167,29 +197,24 @@ func (m *Manager) release(ctx context.Context, p string) (Selection, error) {
 			return Selection{}, fmt.Errorf("GitHub releases: %s", res.Status)
 		}
 		var page []release
-		e = json.NewDecoder(res.Body).Decode(&page)
+		e = json.NewDecoder(io.LimitReader(res.Body, 16<<20)).Decode(&page)
 		res.Body.Close()
 		if e != nil {
 			return Selection{}, e
 		}
 		for _, r := range page {
-			if !r.Draft && !r.Prerelease && Match(p, r.Tag) {
-				xs = append(xs, r)
+			if !r.Draft && !r.Prerelease && Match(p, r.Tag) && (best == nil || r.Published.After(best.Published) || (r.Published.Equal(best.Published) && r.Tag > best.Tag)) {
+				candidate := r
+				best = &candidate
 			}
 		}
 		next = parseNext(res.Header.Get("Link"))
 	}
-	if len(xs) == 0 {
+	if best == nil {
 		return Selection{}, fmt.Errorf("no matching published releases")
 	}
-	sort.Slice(xs, func(i, j int) bool {
-		if xs[i].Published.Equal(xs[j].Published) {
-			return xs[i].Tag > xs[j].Tag
-		}
-		return xs[i].Published.After(xs[j].Published)
-	})
-	sha, e := m.Run(ctx, m.Mirror, "rev-parse", "refs/tags/"+xs[0].Tag+"^{commit}")
-	return Selection{sha, xs[0].Tag, xs[0].Published}, e
+	sha, e := m.Run(ctx, m.Mirror, "rev-parse", "refs/tags/"+best.Tag+"^{commit}")
+	return Selection{sha, best.Tag, best.Published}, e
 }
 func parseNext(h string) string {
 	for _, p := range strings.Split(h, ",") {
@@ -206,7 +231,7 @@ func parseNext(h string) string {
 func (m *Manager) Checkout(ctx context.Context, sha, dst string) error {
 	op, cancel := context.WithTimeout(ctx, 2*time.Minute)
 	defer cancel()
-	if len(sha) != 40 {
+	if !ValidSHA(sha) {
 		return fmt.Errorf("refusing non-exact SHA")
 	}
 	if e := os.MkdirAll(dst, 0700); e != nil {

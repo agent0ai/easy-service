@@ -7,11 +7,13 @@ import (
 	"github.com/example/easy-service/internal/health"
 	"github.com/example/easy-service/internal/proxy"
 	"github.com/example/easy-service/internal/revision"
+	"github.com/example/easy-service/internal/sandbox"
 	"github.com/example/easy-service/internal/state"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -38,8 +40,41 @@ func (i *fi) Stop(context.Context) error {
 func (i *fi) Endpoint() string             { return "http://127.0.0.1:1" }
 func (i *fi) BundlePath() string           { return "/tmp/b" }
 func (i *fi) RootPath() string             { return "/tmp/r" }
-func (i *fi) PID() int                     { return 0 }
 func (i *fi) MemoryUsage() (uint64, error) { return i.mem, nil }
+
+type unstoppableInstance struct {
+	*fi
+	bundle, root string
+}
+
+func (i *unstoppableInstance) Stop(context.Context) error { return errors.New("process did not stop") }
+func (i *unstoppableInstance) BundlePath() string         { return i.bundle }
+func (i *unstoppableInstance) RootPath() string           { return i.root }
+
+func TestFailedStopPreservesFilesystemAndRestartAllowance(t *testing.T) {
+	e, r := engineFor(t, health.New(time.Second, "/"))
+	i := &unstoppableInstance{fi: &fi{done: make(chan error)}, bundle: filepath.Join(e.Cfg.DataDir, "instances", "live"), root: filepath.Join(e.Cfg.DataDir, "runsc-root", "live")}
+	for _, path := range []string{i.bundle, i.root} {
+		if err := os.MkdirAll(path, 0700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	e.cleanup(i, true)
+	for _, path := range []string{i.bundle, i.root} {
+		if _, err := os.Stat(path); err != nil {
+			t.Fatal("cleanup removed a running sandbox filesystem:", err)
+		}
+	}
+	b, _ := proxy.NewBackend(i.Endpoint())
+	e.active = &Active{Revision: strings.Repeat("a", 40), Instance: i, Backend: b, generation: 1}
+	e.Proxy.Set(b)
+	if err := e.Recover(context.Background(), 1); err == nil {
+		t.Fatal("recovery started over a sandbox that had not stopped")
+	}
+	if r.restarts != 0 || r.starts != 0 || e.active.Restarted {
+		t.Fatal("failed stop consumed a restart or launched a process")
+	}
+}
 
 type fr struct {
 	mu               sync.Mutex
@@ -57,8 +92,8 @@ type contextRuntime struct {
 	contexts []context.Context
 }
 
-func (r *contextRuntime) Start(ctx context.Context, id, prepared, command string, port int, env []string) (Instance, error) {
-	i, err := r.fr.Start(ctx, id, prepared, command, port, env)
+func (r *contextRuntime) Start(op, ctx context.Context, id, prepared, command string, port int, env []string) (Instance, error) {
+	i, err := r.fr.Start(op, ctx, id, prepared, command, port, env)
 	if err != nil {
 		return nil, err
 	}
@@ -66,8 +101,11 @@ func (r *contextRuntime) Start(ctx context.Context, id, prepared, command string
 	r.contexts = append(r.contexts, ctx)
 	r.ctxMu.Unlock()
 	go func() {
-		<-ctx.Done()
-		_ = i.Stop(context.Background())
+		select {
+		case <-ctx.Done():
+			_ = i.Stop(context.Background())
+		case <-i.Done():
+		}
 	}()
 	return i, nil
 }
@@ -84,10 +122,9 @@ func (r *fr) Prepare(_ context.Context, id string, _ string, _ string, _ string,
 	return prepared, nil
 }
 func (r *fr) ValidatePrepared(path string) error {
-	_, err := os.Stat(filepath.Join(path, ".easy-service-ready"))
-	return err
+	return (sandbox.Runtime{}).ValidatePrepared(path)
 }
-func (r *fr) Start(context.Context, string, string, string, int, []string) (Instance, error) {
+func (r *fr) Start(context.Context, context.Context, string, string, string, int, []string) (Instance, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.starts++
@@ -101,23 +138,11 @@ func (r *fr) Start(context.Context, string, string, string, int, []string) (Inst
 }
 func (r *fr) Restart(context.Context, string, string, string, int, []string) (Instance, error) {
 	r.mu.Lock()
+	defer r.mu.Unlock()
 	r.restarts++
-	r.mu.Unlock()
 	i := &fi{done: make(chan error), mem: r.memory}
 	r.instances = append(r.instances, i)
 	return i, nil
-}
-func TestRestartAllowanceState(t *testing.T) {
-	a := &Active{}
-	if a.Restarted {
-		t.Fatal()
-	}
-	a.Restarted = true
-	for i := 0; i < 3; i++ { /* successful probes do not mutate restart allowance */
-	}
-	if !a.Restarted {
-		t.Fatal("probe reset restart allowance")
-	}
 }
 func TestFailedCandidatePreservesBackendContract(t *testing.T) {
 	p := proxy.New()
@@ -137,7 +162,9 @@ func TestFailedCandidatePreservesBackendContract(t *testing.T) {
 
 type checkoutFake struct{}
 
-func (checkoutFake) Checkout(context.Context, string, string) error { return nil }
+func (checkoutFake) Checkout(_ context.Context, _ string, path string) error {
+	return os.MkdirAll(path, 0700)
+}
 
 type fakeHealth struct{ ready error }
 
@@ -152,8 +179,8 @@ func engineFor(t *testing.T, h Health) (*Engine, *fr) {
 	t.Helper()
 	d := t.TempDir()
 	sha := "0123456789012345678901234567890123456789"
-	prep := filepath.Join(d, "prepared", preparedID(sha, "sha256:digest"))
-	if err := os.MkdirAll(prep, 0700); err != nil {
+	prep := filepath.Join(d, "prepared", preparedID(sha, "sha256:digest", config.Config{ServicePort: 80}))
+	if err := os.MkdirAll(filepath.Join(prep, "rootfs", "app"), 0700); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(filepath.Join(prep, ".easy-service-ready"), []byte("ok"), 0600); err != nil {
@@ -161,6 +188,7 @@ func engineFor(t *testing.T, h Health) (*Engine, *fr) {
 	}
 	r := &fr{data: d}
 	e := &Engine{Cfg: config.Config{DataDir: d, RuntimeImage: "image", RunCommand: "x", ServicePort: 80, StartupTimeout: time.Second, HealthInterval: time.Millisecond, HealthFailures: 1}, Runtime: r, Checkout: checkoutFake{}, Proxy: proxy.New(), Store: state.Store{Data: d}, Health: h, Rootfs: t.TempDir(), Digest: "sha256:digest", Drain: time.Millisecond, Failures: make(chan uint64, 4)}
+	t.Cleanup(func() { e.Shutdown(context.Background()) })
 	return e, r
 }
 
@@ -190,6 +218,46 @@ func TestOneRestartThenFreshRedeploy(t *testing.T) {
 	}
 	if r.restarts != 2 {
 		t.Fatalf("fresh deployment received no restart allowance: restarts=%d", r.restarts)
+	}
+}
+
+func TestPreparationCacheTracksSetupInputs(t *testing.T) {
+	e, _ := engineFor(t, fakeHealth{})
+	sel := revision.Selection{SHA: strings.Repeat("a", 40)}
+	if err := e.Deploy(context.Background(), sel); err != nil {
+		t.Fatal(err)
+	}
+	for _, change := range []func(){
+		func() { e.Cfg.SetupCommand = "install new dependencies" },
+		func() { e.Cfg.AppEnv = []string{"MODE=new"} },
+		func() { e.Cfg.ServicePort = 8080 },
+	} {
+		before := e.active.Prepared
+		change()
+		if err := e.Deploy(context.Background(), sel); err != nil {
+			t.Fatal(err)
+		}
+		if e.active.Prepared == before {
+			t.Fatal("changed setup inputs reused a stale prepared installation")
+		}
+	}
+	before := e.active.Prepared
+	e.Cfg.RunCommand = "another foreground server"
+	if err := e.Deploy(context.Background(), sel); err != nil {
+		t.Fatal(err)
+	}
+	if e.active.Prepared != before {
+		t.Fatal("run-only configuration rebuilt the installation")
+	}
+}
+
+func TestInvalidSelectionRejectedBeforePreparation(t *testing.T) {
+	e, rt := engineFor(t, fakeHealth{})
+	if err := e.Deploy(context.Background(), revision.Selection{SHA: strings.Repeat("z", 40)}); err == nil {
+		t.Fatal("invalid selection deployed")
+	}
+	if rt.starts != 0 || e.active != nil {
+		t.Fatal("invalid selection reached the sandbox")
 	}
 }
 
@@ -286,6 +354,94 @@ func TestInitialDeploymentRetriesAtHealthInterval(t *testing.T) {
 	case <-done:
 	case <-time.After(time.Second):
 		t.Fatal("controller did not stop")
+	}
+}
+
+func TestRepeatedPollDoesNotBypassRetryDelay(t *testing.T) {
+	e, r := engineFor(t, fakeHealth{})
+	r.failStarts = 100
+	e.Cfg.PollInterval = time.Millisecond
+	e.Cfg.HealthInterval = time.Hour
+	c := Controller{Cfg: e.Cfg, Selector: staticSelector{revision.Selection{SHA: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}, Engine: e}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { c.Run(ctx); close(done) }()
+	deadline := time.Now().Add(time.Second)
+	for {
+		r.mu.Lock()
+		starts := r.starts
+		r.mu.Unlock()
+		if starts > 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			cancel()
+			<-done
+			t.Fatal("initial attempt never started")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	time.Sleep(30 * time.Millisecond)
+	cancel()
+	<-done
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.starts != 1 {
+		t.Fatalf("polling retried a broken revision during backoff: starts=%d", r.starts)
+	}
+}
+
+func TestBrokenPendingUpdateDoesNotStarveActiveRecovery(t *testing.T) {
+	e, r := engineFor(t, fakeHealth{})
+	a := revision.Selection{SHA: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}
+	b := revision.Selection{SHA: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}
+	if err := e.Deploy(context.Background(), a); err != nil {
+		t.Fatal(err)
+	}
+	generation := e.active.generation
+	r.failStarts = 100
+	e.Cfg.PollInterval = time.Hour
+	e.Cfg.HealthInterval = time.Hour
+	c := Controller{Cfg: e.Cfg, Selector: staticSelector{b}, Engine: e}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan struct{})
+	go func() { c.Run(ctx); close(done) }()
+	deadline := time.After(time.Second)
+	for {
+		r.mu.Lock()
+		starts := r.starts
+		r.mu.Unlock()
+		if starts >= 2 {
+			break
+		}
+		select {
+		case <-deadline:
+			t.Fatal("pending update never attempted")
+		case <-time.After(time.Millisecond):
+		}
+	}
+	e.Failures <- generation
+	deadline = time.After(100 * time.Millisecond)
+	for {
+		r.mu.Lock()
+		restarts := r.restarts
+		r.mu.Unlock()
+		if restarts == 1 {
+			break
+		}
+		select {
+		case <-deadline:
+			cancel()
+			<-done
+			t.Fatal("broken pending update starved active recovery")
+		case <-time.After(time.Millisecond):
+		}
+	}
+	cancel()
+	<-done
+	if e.Proxy.Current() == nil || e.Selected() != a.SHA {
+		t.Fatal("recovered active revision was not routed")
 	}
 }
 
@@ -711,6 +867,31 @@ func TestOriginalDeathCancelsMemoryReplacement(t *testing.T) {
 	}
 }
 
+func TestActiveDeathInterruptsStalledUpdate(t *testing.T) {
+	h := &scriptedHealth{blockAt: 2, entered: make(chan struct{})}
+	e, _ := engineFor(t, h)
+	if err := e.Deploy(context.Background(), revision.Selection{SHA: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}); err != nil {
+		t.Fatal(err)
+	}
+	old := e.active.Instance
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	result := make(chan error, 1)
+	go func() { result <- e.Deploy(ctx, revision.Selection{SHA: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}) }()
+	<-h.entered
+	_ = old.Stop(context.Background())
+	select {
+	case err := <-result:
+		if err == nil {
+			t.Fatal("stalled update succeeded")
+		}
+	case <-time.After(100 * time.Millisecond):
+		cancel()
+		<-result
+		t.Fatal("stalled update blocked recovery after active process death")
+	}
+}
+
 func TestShutdownDrainsBeforeStoppingSandbox(t *testing.T) {
 	started := make(chan struct{})
 	release := make(chan struct{})
@@ -750,7 +931,7 @@ func TestShutdownDrainsBeforeStoppingSandbox(t *testing.T) {
 func TestShutdownPreservesDurableStateForRestartRecovery(t *testing.T) {
 	data := t.TempDir()
 	store := state.Store{Data: data}
-	want := state.State{Revision: "abc", Digest: "sha256:digest", ImageRef: "image", Prepared: filepath.Join(data, "prepared", "abc")}
+	want := state.State{Revision: "abc", Digest: "sha256:digest", GitURL: "/source", ImageRef: "image"}
 	if err := store.Save(want); err != nil {
 		t.Fatal(err)
 	}
@@ -765,7 +946,7 @@ func TestShutdownPreservesDurableStateForRestartRecovery(t *testing.T) {
 	if err != nil {
 		t.Fatalf("shutdown removed cached recovery state: %v", err)
 	}
-	if got.Revision != want.Revision || got.Digest != want.Digest || got.Prepared != want.Prepared {
+	if got != want {
 		t.Fatalf("shutdown changed cached recovery state: got %+v", got)
 	}
 }

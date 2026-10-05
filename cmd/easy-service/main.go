@@ -22,13 +22,20 @@ import (
 
 type runtimeAdapter struct{ sandbox.Runtime }
 
-func (r runtimeAdapter) Start(c context.Context, a, b, d string, p int, e []string) (supervisor.Instance, error) {
-	return r.Runtime.Start(c, a, b, d, p, e)
+func (r runtimeAdapter) Start(c, lifetime context.Context, a, b, d string, p int, e []string) (supervisor.Instance, error) {
+	return r.Runtime.Start(c, lifetime, a, b, d, p, e)
 }
 func (r runtimeAdapter) Restart(c context.Context, a, b, d string, p int, e []string) (supervisor.Instance, error) {
 	return r.Runtime.Restart(c, a, b, d, p, e)
 }
 func main() {
+	if len(os.Args) > 1 {
+		if err := cli(os.Args[1:], os.Stdout); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		return
+	}
 	cfg, err := config.Load()
 	if err != nil {
 		log.Fatal(err)
@@ -70,6 +77,15 @@ func run(ctx context.Context, cfg config.Config, p *proxy.Proxy, serverDrained <
 	runtimeCtx, cancelRuntime := context.WithCancel(context.Background())
 	defer cancelRuntime()
 	store := state.Store{Data: cfg.DataDir}
+	git := revision.New(cfg.GitURL, cfg.GitToken, cfg.DataDir)
+	rt := runtimeAdapter{sandbox.Runtime{Data: cfg.DataDir, Stdout: os.Stdout, Stderr: os.Stderr}}
+	engine := &supervisor.Engine{Cfg: cfg, Runtime: rt, Checkout: git, Proxy: p, Store: store, Health: health.New(cfg.HealthInterval, cfg.HealthPath), Drain: 30 * time.Second, RuntimeContext: runtimeCtx, Failures: make(chan uint64, 1), MemoryExceeded: make(chan uint64, 1)}
+	controller := &supervisor.Controller{Cfg: cfg, Selector: git, Engine: engine}
+	closeControl, err := controller.StartControl(ctx)
+	if err != nil {
+		return fmt.Errorf("control socket: %w", err)
+	}
+	defer closeControl()
 	prior, _ := store.Load()
 	if err := store.Reconcile(); err != nil {
 		return fmt.Errorf("restart reconciliation: %w", err)
@@ -92,14 +108,10 @@ func run(ctx context.Context, cfg config.Config, p *proxy.Proxy, serverDrained <
 		case <-time.After(cfg.HealthInterval):
 		}
 	}
-	git := revision.New(cfg.GitURL, cfg.GitToken, cfg.DataDir)
-	rt := runtimeAdapter{sandbox.Runtime{Data: cfg.DataDir, Stdout: os.Stdout, Stderr: os.Stderr}}
-	engine := &supervisor.Engine{Cfg: cfg, Runtime: rt, Checkout: git, Proxy: p, Store: store, Health: health.New(cfg.HealthInterval, cfg.HealthPath), Rootfs: prepared.Rootfs, Digest: prepared.Digest, Drain: 30 * time.Second, RuntimeContext: runtimeCtx, Failures: make(chan uint64, 1), MemoryExceeded: make(chan uint64, 1)}
-	var initial *revision.Selection
-	if prior.ImageRef == cfg.RuntimeImage && prior.Revision != "" {
-		initial = &revision.Selection{SHA: prior.Revision, Name: "recovery"}
+	engine.Rootfs, engine.Digest = prepared.Rootfs, prepared.Digest
+	if prior.Recoverable(cfg.GitURL, cfg.RuntimeImage) {
+		controller.Initial = &revision.Selection{SHA: prior.Revision, Name: "recovery"}
 	}
-	controller := &supervisor.Controller{Cfg: cfg, Selector: git, Engine: engine, Initial: initial}
 	controller.Run(ctx)
 	<-serverDrained
 	shutdown, cancel := context.WithTimeout(context.Background(), 35*time.Second)

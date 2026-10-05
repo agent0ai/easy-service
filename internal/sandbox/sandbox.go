@@ -15,6 +15,8 @@ import (
 	"sync"
 	"syscall"
 	"time"
+
+	"github.com/example/easy-service/internal/process"
 )
 
 type Spec struct {
@@ -57,6 +59,7 @@ type Instance struct {
 	Port             int
 	cmd              *exec.Cmd
 	done             chan error
+	waitErr          error
 	once             sync.Once
 }
 type Runtime struct {
@@ -85,8 +88,8 @@ func Validate() error {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, "rootlesskit", "--net=slirp4netns", "--port-driver=builtin", "--", "true")
-	if b, e := cmd.CombinedOutput(); e != nil {
+	cmd := process.Command(ctx, "rootlesskit", "--net=slirp4netns", "--disable-host-loopback", "--port-driver=builtin", "--", "true")
+	if b, e := process.Output(cmd); e != nil {
 		return fmt.Errorf("nested rootless networking preflight failed: %w: %s", e, strings.TrimSpace(string(b)))
 	}
 	return nil
@@ -95,8 +98,8 @@ func CopyTree(ctx context.Context, src, dst string) error {
 	if e := os.MkdirAll(dst, 0700); e != nil {
 		return e
 	}
-	c := exec.CommandContext(ctx, "cp", "-a", "--reflink=auto", filepath.Clean(src)+"/.", dst)
-	if b, e := c.CombinedOutput(); e != nil {
+	c := process.Command(ctx, "cp", "-a", "--reflink=auto", filepath.Clean(src)+"/.", dst)
+	if b, e := process.Output(c); e != nil {
 		return fmt.Errorf("copy filesystem: %w: %s", e, b)
 	}
 	return nil
@@ -114,7 +117,13 @@ func (r Runtime) Prepare(ctx context.Context, id, base, checkout, setup string, 
 	if e := CopyTree(ctx, base, filepath.Join(dir, "rootfs")); e != nil {
 		return "", e
 	}
-	if e := CopyTree(ctx, checkout, filepath.Join(dir, "rootfs", "app")); e != nil {
+	app := filepath.Join(dir, "rootfs", "app")
+	// An image's /app symlink is relative to the container filesystem, not the
+	// supervisor. Replace it before any host copy can follow it out of rootfs.
+	if e := os.RemoveAll(app); e != nil {
+		return "", e
+	}
+	if e := CopyTree(ctx, checkout, app); e != nil {
 		return "", e
 	}
 	if setup != "" {
@@ -125,6 +134,9 @@ func (r Runtime) Prepare(ctx context.Context, id, base, checkout, setup string, 
 			return "", e
 		}
 		e = i.Wait(op)
+		stopCtx, stopCancel := context.WithTimeout(context.Background(), 10*time.Second)
+		_ = i.Stop(stopCtx)
+		stopCancel()
 		_ = os.RemoveAll(i.RootPath())
 		if e != nil {
 			return "", fmt.Errorf("setup failed: %w", e)
@@ -143,7 +155,7 @@ func (r Runtime) ValidatePrepared(dir string) error {
 	}
 	return nil
 }
-func (r Runtime) Start(ctx context.Context, id, prepared, command string, servicePort int, env []string) (*Instance, error) {
+func (r Runtime) Start(ctx, lifetime context.Context, id, prepared, command string, servicePort int, env []string) (*Instance, error) {
 	bundle := filepath.Join(r.Data, "instances", id)
 	root := filepath.Join(r.Data, "runsc-root", id)
 	ok := false
@@ -159,7 +171,10 @@ func (r Runtime) Start(ctx context.Context, id, prepared, command string, servic
 	if e := CopyTree(ctx, filepath.Join(prepared, "rootfs"), filepath.Join(bundle, "rootfs")); e != nil {
 		return nil, e
 	}
-	i, err := r.start(ctx, id, bundle, command, servicePort, env)
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	i, err := r.start(lifetime, id, bundle, command, servicePort, env)
 	ok = err == nil
 	return i, err
 }
@@ -183,19 +198,23 @@ func processTreeRSS(root int) (uint64, error) {
 	if root <= 1 {
 		return 0, fmt.Errorf("sandbox process is not running")
 	}
-	entries, err := os.ReadDir("/proc")
-	if err != nil {
-		return 0, err
-	}
-	parents := make(map[int]int)
-	rss := make(map[int]uint64)
-	for _, entry := range entries {
-		pid, err := strconv.Atoi(entry.Name())
-		if err != nil {
+	type child struct{ pid, parent int }
+	pending := []child{{root, 0}}
+	seen := make(map[int]bool)
+	var total uint64
+	for len(pending) > 0 {
+		next := pending[len(pending)-1]
+		pending = pending[:len(pending)-1]
+		if seen[next.pid] {
 			continue
 		}
-		stat, err := os.ReadFile(filepath.Join("/proc", entry.Name(), "stat"))
+		seen[next.pid] = true
+		dir := filepath.Join("/proc", strconv.Itoa(next.pid))
+		stat, err := os.ReadFile(filepath.Join(dir, "stat"))
 		if err != nil {
+			if next.pid == root {
+				return 0, err
+			}
 			continue
 		}
 		closeParen := strings.LastIndexByte(string(stat), ')')
@@ -206,27 +225,33 @@ func processTreeRSS(root int) (uint64, error) {
 		if len(fields) < 22 {
 			continue
 		}
-		parents[pid], _ = strconv.Atoi(fields[1])
-		pages, _ := strconv.ParseUint(fields[21], 10, 64)
-		rss[pid] = pages * uint64(os.Getpagesize())
-	}
-	owned := map[int]bool{root: true}
-	changed := true
-	for changed {
-		changed = false
-		for pid, parent := range parents {
-			if !owned[pid] && owned[parent] {
-				owned[pid] = true
-				changed = true
+		parent, _ := strconv.Atoi(fields[1])
+		if next.parent != 0 && parent != next.parent {
+			continue // a short-lived child PID was reused outside our tree
+		}
+		pages, err := strconv.ParseUint(fields[21], 10, 64)
+		if err != nil {
+			return 0, fmt.Errorf("invalid sandbox RSS: %w", err)
+		}
+		total += pages * uint64(os.Getpagesize())
+		// A process can fork from any thread. The leader's children file alone
+		// would miss subprocesses started by other runsc/rootlesskit threads.
+		tasks, err := os.ReadDir(filepath.Join(dir, "task"))
+		if err != nil {
+			continue
+		}
+		for _, task := range tasks {
+			children, err := os.ReadFile(filepath.Join(dir, "task", task.Name(), "children"))
+			if err != nil {
+				continue
+			}
+			for _, raw := range strings.Fields(string(children)) {
+				pid, err := strconv.Atoi(raw)
+				if err == nil && pid > 1 {
+					pending = append(pending, child{pid, next.pid})
+				}
 			}
 		}
-	}
-	var total uint64
-	for pid := range owned {
-		total += rss[pid]
-	}
-	if _, ok := rss[root]; !ok {
-		return 0, fmt.Errorf("sandbox process %d is not running", root)
 	}
 	return total, nil
 }
@@ -248,29 +273,38 @@ func (r Runtime) start(ctx context.Context, id, bundle, command string, serviceP
 		l.Close()
 	}
 	spec := Spec{OCIVersion: "1.0.2", Process: Process{User: User{0, 0}, Args: []string{"/bin/sh", "-c", command}, Env: workloadEnv(env, servicePort), Cwd: "/app", NoNewPrivileges: true}, Root: Root{"rootfs", false}, Mounts: []Mount{{"/proc", "proc", "proc", nil}, {"/dev", "tmpfs", "tmpfs", []string{"nosuid", "strictatime", "mode=755", "size=65536k"}}, {"/tmp", "tmpfs", "tmpfs", []string{"nosuid", "nodev", "mode=1777", "size=64m"}}}, Linux: Linux{[]Namespace{{"pid"}, {"ipc"}, {"uts"}, {"mount"}}}}
+	// OCI images need not contain resolv.conf. Slirp's default private DNS
+	// endpoint belongs to this network, independent of the supervisor resolver.
+	dns, e := filepath.Abs(filepath.Join(bundle, "resolv.conf"))
+	if e != nil {
+		return nil, e
+	}
+	if e := os.WriteFile(dns, []byte("nameserver 10.0.2.3\n"), 0600); e != nil {
+		return nil, e
+	}
+	spec.Mounts = append(spec.Mounts, Mount{"/etc/resolv.conf", "bind", dns, []string{"bind", "ro", "nosuid", "nodev", "noexec"}})
 	b, _ := json.Marshal(spec)
 	if e := os.WriteFile(filepath.Join(bundle, "config.json"), b, 0600); e != nil {
 		return nil, e
 	}
-	args := []string{"--net=slirp4netns", "--port-driver=builtin"}
+	args := []string{"--net=slirp4netns", "--disable-host-loopback", "--port-driver=builtin"}
 	if port > 0 {
 		args = append(args, "-p", fmt.Sprintf("127.0.0.1:%d:%d/tcp", port, servicePort))
 	}
 	root := filepath.Join(r.Data, "runsc-root", id)
 	args = append(args, "--", "runsc", "--rootless=true", "--network=host", "--file-access=exclusive", "--root", root, "run", "--bundle", bundle, id)
-	cmd := exec.CommandContext(ctx, "rootlesskit", args...)
+	cmd := process.Command(ctx, "rootlesskit", args...)
 	phase, logID := "run", id
 	if strings.HasPrefix(id, "setup-") {
 		phase, logID = "setup", strings.TrimPrefix(id, "setup-")
 	}
 	cmd.Stdout = &prefixWriter{r.Stdout, "[" + logID + "][" + phase + "][stdout] "}
 	cmd.Stderr = &prefixWriter{r.Stderr, "[" + logID + "][" + phase + "][stderr] "}
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	if e := cmd.Start(); e != nil {
 		return nil, e
 	}
-	i := &Instance{id, bundle, root, port, cmd, make(chan error, 1), sync.Once{}}
-	go func() { i.done <- cmd.Wait(); close(i.done) }()
+	i := &Instance{ID: id, Bundle: bundle, Root: root, Port: port, cmd: cmd, done: make(chan error)}
+	go func() { i.waitErr = process.Wait(cmd); close(i.done) }()
 	return i, nil
 }
 func workloadEnv(app []string, servicePort int) []string {
@@ -296,8 +330,8 @@ func workloadEnv(app []string, servicePort int) []string {
 }
 func (i *Instance) Wait(ctx context.Context) error {
 	select {
-	case e := <-i.done:
-		return e
+	case <-i.done:
+		return i.waitErr
 	case <-ctx.Done():
 		return ctx.Err()
 	}
@@ -311,6 +345,9 @@ func (i *Instance) Exited() bool {
 	}
 }
 func (i *Instance) Stop(ctx context.Context) error {
+	if i.Exited() {
+		return nil // a stale PID may now belong to a different process group
+	}
 	i.once.Do(func() {
 		if i.cmd.Process != nil {
 			_ = syscall.Kill(-i.cmd.Process.Pid, syscall.SIGTERM)
@@ -323,7 +360,16 @@ func (i *Instance) Stop(ctx context.Context) error {
 		if i.cmd.Process != nil {
 			_ = syscall.Kill(-i.cmd.Process.Pid, syscall.SIGKILL)
 		}
-		return ctx.Err()
+		// Killing is asynchronous. Reap before callers reuse or remove the
+		// installation, allowing for Command's one-second output-pipe deadline.
+		t := time.NewTimer(2 * time.Second)
+		defer t.Stop()
+		select {
+		case <-i.done:
+			return nil
+		case <-t.C:
+			return fmt.Errorf("sandbox did not finish after forced stop: %w", ctx.Err())
+		}
 	}
 }
 

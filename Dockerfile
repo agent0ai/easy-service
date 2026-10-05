@@ -10,13 +10,14 @@ RUN CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH go build -trimpath -ldflags=
 FROM debian:bookworm-slim AS runsc
 ARG TARGETARCH
 ARG GVISOR_RELEASE=release/latest
-RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl && rm -rf /var/lib/apt/lists/* \
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl zstd && rm -rf /var/lib/apt/lists/* \
  && case "$TARGETARCH" in amd64) arch=x86_64;; arm64) arch=aarch64;; *) exit 1;; esac \
  && base="https://storage.googleapis.com/gvisor/releases/${GVISOR_RELEASE}/${arch}" \
- && curl -fsSLo /runsc "$base/runsc" \
- && curl -fsSLo /runsc.sha512 "$base/runsc.sha512" \
- && (cd / && sha512sum -c runsc.sha512) \
- && chmod 0755 /runsc
+ && curl -fsSLo /gvisor.tar.zstd "$base/gvisor.tar.zstd" \
+ && curl -fsSLo /gvisor.tar.zstd.sha512 "$base/gvisor.tar.zstd.sha512" \
+ && (cd / && sha512sum -c gvisor.tar.zstd.sha512) \
+ && mkdir /out && tar --zstd -xf /gvisor.tar.zstd -C /out \
+ && rm -f /out/containerd-shim-runsc-v1
 
 FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -26,7 +27,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
  && echo 'easyservice:100000:65536' >> /etc/subuid \
  && echo 'easyservice:100000:65536' >> /etc/subgid
 COPY --from=build /out/easy-service /usr/local/bin/easy-service
-COPY --from=runsc /runsc /usr/local/bin/runsc
+COPY --from=runsc /out/ /usr/local/bin/
 RUN setcap cap_net_bind_service=+ep /usr/local/bin/easy-service \
  && apt-get purge -y libcap2-bin \
  && rm -rf /var/lib/apt/lists/* \

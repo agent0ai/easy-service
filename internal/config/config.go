@@ -5,6 +5,7 @@ import (
 	"math"
 	"net/url"
 	"os"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -21,7 +22,7 @@ type Config struct {
 }
 
 func Load() (Config, error) {
-	c := Config{GitURL: os.Getenv("GIT_URL"), GitToken: os.Getenv("GIT_TOKEN"), GitBranch: val("GIT_BRANCH", "main"), UpdateMethod: val("UPDATE_METHOD", "commit"), UpdatePattern: val("UPDATE_PATTERN", "*"), RuntimeImage: os.Getenv("RUNTIME_IMAGE"), SetupCommand: os.Getenv("SETUP_COMMAND"), RunCommand: os.Getenv("RUN_COMMAND"), HealthPath: val("HEALTH_PATH", "/"), DataDir: val("DATA_DIR", "/data")}
+	c := Config{GitURL: os.Getenv("GIT_URL"), GitToken: os.Getenv("GIT_TOKEN"), GitBranch: val("GIT_BRANCH", "main"), UpdateMethod: val("UPDATE_METHOD", "commit"), UpdatePattern: val("UPDATE_PATTERN", "*"), RuntimeImage: val("RUNTIME_IMAGE", "debian:bookworm-slim"), SetupCommand: os.Getenv("SETUP_COMMAND"), RunCommand: os.Getenv("RUN_COMMAND"), HealthPath: val("HEALTH_PATH", "/"), DataDir: val("DATA_DIR", "/data")}
 	var err error
 	if c.PollInterval, err = duration("POLL_INTERVAL", 300); err != nil {
 		return c, err
@@ -50,16 +51,30 @@ func Load() (Config, error) {
 		}
 	}
 	sort.Strings(c.AppEnv)
-	if c.GitURL == "" || c.RuntimeImage == "" || c.RunCommand == "" {
-		return c, fmt.Errorf("GIT_URL, RUNTIME_IMAGE, and RUN_COMMAND are required")
+	if c.GitURL == "" || c.RunCommand == "" {
+		return c, fmt.Errorf("GIT_URL and RUN_COMMAND are required")
 	}
 	u, e := url.Parse(c.GitURL)
-	if e != nil || u.Scheme != "https" || u.Host != "github.com" || u.User != nil {
+	if e == nil && u.Scheme == "" && u.Host == "" && u.RawQuery == "" && u.Fragment == "" {
+		path, err := filepath.Abs(c.GitURL)
+		if err != nil {
+			return c, fmt.Errorf("invalid local GIT_URL path: %w", err)
+		}
+		st, err := os.Stat(path)
+		if err != nil || !st.IsDir() {
+			return c, fmt.Errorf("local GIT_URL must be an existing repository directory")
+		}
+		if c.UpdateMethod == "release" {
+			return c, fmt.Errorf("UPDATE_METHOD=release requires a GitHub repository")
+		}
+		c.GitURL = path
+	} else if e != nil || u.Scheme != "https" || u.Host != "github.com" || u.User != nil {
 		return c, fmt.Errorf("GIT_URL must be an HTTPS github.com URL without embedded credentials")
-	}
-	parts := strings.Split(strings.TrimSuffix(strings.TrimPrefix(u.Path, "/"), ".git"), "/")
-	if len(parts) != 2 || parts[0] == "" || parts[1] == "" || u.RawQuery != "" || u.Fragment != "" {
-		return c, fmt.Errorf("GIT_URL must identify exactly one GitHub owner/repository")
+	} else {
+		parts := strings.Split(strings.TrimSuffix(strings.TrimPrefix(u.Path, "/"), ".git"), "/")
+		if len(parts) != 2 || parts[0] == "" || parts[1] == "" || u.RawQuery != "" || u.Fragment != "" {
+			return c, fmt.Errorf("GIT_URL must identify exactly one GitHub owner/repository")
+		}
 	}
 	if c.UpdateMethod != "commit" && c.UpdateMethod != "tag" && c.UpdateMethod != "release" {
 		return c, fmt.Errorf("UPDATE_METHOD must be commit, tag, or release")
@@ -104,7 +119,7 @@ func val(k, d string) string {
 }
 func duration(k string, d int) (time.Duration, error) {
 	v, e := strconv.ParseFloat(val(k, strconv.Itoa(d)), 64)
-	if e != nil || math.IsNaN(v) || math.IsInf(v, 0) || v <= 0 || v > float64(math.MaxInt64)/float64(time.Second) {
+	if e != nil || math.IsNaN(v) || math.IsInf(v, 0) || v*float64(time.Second) < 1 || v*float64(time.Second) >= float64(math.MaxInt64) {
 		return 0, fmt.Errorf("%s must be positive numeric seconds", k)
 	}
 	return time.Duration(v * float64(time.Second)), nil

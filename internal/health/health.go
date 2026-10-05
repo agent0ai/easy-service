@@ -19,6 +19,9 @@ type Checker struct {
 
 func ProbeTimeout(interval time.Duration) time.Duration {
 	d := interval / 2
+	if d < time.Nanosecond {
+		return time.Nanosecond
+	}
 	if d > 3*time.Second {
 		return 3 * time.Second
 	}
@@ -61,14 +64,15 @@ func (c *Checker) Ready(ctx context.Context, base string, p Exited, startup time
 			return fmt.Errorf("process exited before readiness")
 		}
 		remaining := time.Until(deadline)
-		if e := c.probeWhileRunning(ctx, base, remaining, p); e == nil && !p.Exited() {
+		err := c.probeWhileRunning(ctx, base, remaining, p)
+		if err == nil && !p.Exited() {
 			return nil
 		} else if p.Exited() {
 			return fmt.Errorf("process exited before readiness")
 		}
 		remaining = time.Until(deadline)
 		if remaining <= 0 {
-			return fmt.Errorf("startup health timeout")
+			return fmt.Errorf("startup health timeout: %w", err)
 		}
 		wait := c.Interval
 		if wait > remaining {

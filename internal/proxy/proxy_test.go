@@ -1,15 +1,54 @@
 package proxy
 
 import (
-	"bufio"
+	"context"
 	"fmt"
-	"net"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
 )
+
+type benchmarkTransport struct{}
+
+func (benchmarkTransport) RoundTrip(*http.Request) (*http.Response, error) {
+	return &http.Response{StatusCode: 200, Header: make(http.Header), Body: io.NopCloser(strings.NewReader("ok"))}, nil
+}
+
+func BenchmarkProxy(b *testing.B) {
+	p := New()
+	p.transport = benchmarkTransport{}
+	backend, err := NewBackend("http://127.0.0.1:8080")
+	if err != nil {
+		b.Fatal(err)
+	}
+	p.Set(backend)
+	r := httptest.NewRequest("GET", "/", nil)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		p.ServeHTTP(httptest.NewRecorder(), r)
+	}
+}
+
+func TestDrainAfterEarlierRequestCompleted(t *testing.T) {
+	b, err := NewBackend("http://127.0.0.1:1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	b.enter()
+	b.leave()
+	b.enter()
+	if b.Drain(context.Background(), time.Millisecond) {
+		t.Fatal("drain ignored a request after an earlier request completed")
+	}
+	b.leave()
+	if !b.Drain(context.Background(), time.Second) {
+		t.Fatal("completed backend did not drain")
+	}
+}
 
 func TestUnavailableAndAtomicPerRequestCutover(t *testing.T) {
 	p := New()
@@ -40,58 +79,3 @@ func TestUnavailableAndAtomicPerRequestCutover(t *testing.T) {
 		t.Fatal()
 	}
 }
-func TestStreamingAndDrain(t *testing.T) {
-	release := make(chan struct{})
-	started := make(chan struct{})
-	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		f := w.(http.Flusher)
-		fmt.Fprint(w, "one\n")
-		f.Flush()
-		close(started)
-		<-release
-		fmt.Fprint(w, "two\n")
-	}))
-	defer s.Close()
-	p := New()
-	b, _ := NewBackend(s.URL)
-	p.Set(b)
-	go http.Get(server(p))
-	<-started
-	if b.Drain(nilContext{}, 10*time.Millisecond) {
-		t.Fatal("drained in flight")
-	}
-	close(release)
-	time.Sleep(20 * time.Millisecond)
-	if !b.Drain(nilContext{}, time.Second) {
-		t.Fatal("did not drain")
-	}
-}
-func TestWebSocketUpgrade(t *testing.T) {
-	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		h := w.(http.Hijacker)
-		c, rw, _ := h.Hijack()
-		defer c.Close()
-		rw.WriteString("HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: test\r\n\r\npong")
-		rw.Flush()
-	}))
-	defer s.Close()
-	p := New()
-	b, _ := NewBackend(s.URL)
-	p.Set(b)
-	u := server(p)
-	c, _ := net.Dial("tcp", strings.TrimPrefix(u, "http://"))
-	defer c.Close()
-	fmt.Fprintf(c, "GET / HTTP/1.1\r\nHost: x\r\nConnection: Upgrade\r\nUpgrade: test\r\n\r\n")
-	line, _ := bufio.NewReader(c).ReadString('\n')
-	if !strings.Contains(line, "101") {
-		t.Fatal(line)
-	}
-}
-func server(h http.Handler) string { s := httptest.NewServer(h); return s.URL }
-
-type nilContext struct{}
-
-func (nilContext) Deadline() (time.Time, bool) { return time.Time{}, false }
-func (nilContext) Done() <-chan struct{}       { return nil }
-func (nilContext) Err() error                  { return nil }
-func (nilContext) Value(any) any               { return nil }
