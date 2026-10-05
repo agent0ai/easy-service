@@ -103,7 +103,7 @@ func (e *Engine) Replace(ctx context.Context, generation uint64) error {
 	if a.Instance.Exited() {
 		return fmt.Errorf("active deployment exited before replacement")
 	}
-	return e.deploy(ctx, ctx, revision.Selection{SHA: a.Revision, Name: "memory replacement"}, &generation)
+	return e.deploy(ctx, ctx, revision.Selection{SHA: a.Revision}, &generation)
 }
 
 func (e *Engine) deploy(ctx, watchCtx context.Context, sel revision.Selection, expected *uint64) error {
@@ -240,9 +240,10 @@ func (e *Engine) removeOtherPrepared(keep string) {
 }
 func preparedID(sha, digest string, cfg config.Config) string {
 	inputs := struct {
+		Version            int
 		SHA, Digest, Setup string
 		Env                []string
-	}{sha, digest, cfg.SetupCommand, cfg.AppEnv}
+	}{2, sha, digest, cfg.SetupCommand, cfg.AppEnv}
 	b, _ := json.Marshal(inputs)
 	h := sha256.Sum256(b)
 	return hex.EncodeToString(h[:])

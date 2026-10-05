@@ -44,6 +44,9 @@ func TestPaginatedReleaseSelection(t *testing.T) {
 	m := &Manager{URL: "https://github.com/a/b.git", Client: srv.Client(), Mirror: t.TempDir()}
 	m.Run = func(_ context.Context, _ string, a ...string) (string, error) {
 		if a[0] == "rev-parse" {
+			if a[1] != "refs/tags/v2^{commit}" {
+				t.Fatal("wrong published release selected:", a)
+			}
 			return strings.Repeat("a", 40), nil
 		}
 		return "", nil
@@ -53,7 +56,7 @@ func TestPaginatedReleaseSelection(t *testing.T) {
 		return http.DefaultTransport.RoundTrip(r)
 	})
 	s, e := m.release(context.Background(), "v*")
-	if e != nil || s.Name != "v2" || !s.Time.Equal(time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC)) {
+	if e != nil || s.SHA != strings.Repeat("a", 40) {
 		t.Fatalf("%+v %v", s, e)
 	}
 }
@@ -133,7 +136,7 @@ func TestCommitTagAndExactCleanCheckout(t *testing.T) {
 		return run(ctx, dir, args...)
 	}
 	tag, e := m.Select(context.Background(), "tag", "", "v*")
-	if e != nil || tag.Name != "v2-annotated" || tag.SHA != commit.SHA {
+	if e != nil || tag.SHA != commit.SHA {
 		t.Fatalf("tag=%+v err=%v", tag, e)
 	}
 	if resolveCalls != 2 {

@@ -19,7 +19,7 @@ Own the serialized deployment, cutover, drain and recovery engine.
 - Serve status concurrently with actions. Limit control clients to one pending/running action; use a 0700 control directory and 0600 Unix socket under DATA_DIR, recover stale sockets, and refuse to replace live sockets or ordinary files.
 - Status reports service state, active revision, runtime image/digest and memory usage, limit or sampling error; keep internal lifecycle bookkeeping out of the status payload.
 - Save the configured Git source URL on deployment and recovery so startup cannot reuse a revision from another repository sharing the data directory.
-- Preparation identity includes the full SHA, image digest, setup command and application environment. Runtime-assigned ports and run-command-only changes reuse preparation.
+- Preparation identity includes format version 2, full SHA, image digest, setup command and application environment. The version invalidates installs prepared before image-environment and HOME/tmp persistence fixes. Runtime-assigned ports and run-command-only changes reuse preparation.
 - Reject invalid revision selections before filesystem/preparation work.
 - Cancel candidate work if the serving instance exits or fails health; never route an exited/cancelled candidate.
 - Memory pressure requests same-revision deployment through the same cutover/readiness/drain engine.

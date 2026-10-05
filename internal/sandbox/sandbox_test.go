@@ -39,14 +39,25 @@ func TestPrivateWritableCopies(t *testing.T) {
 	}
 }
 
-func TestStrictWorkloadEnvironment(t *testing.T) {
-	got := workloadEnv([]string{"SECRET=app", "PORT=wrong", "PATH=wrong", "GIT_TOKEN=explicit-app-value"}, 8080)
+func TestWorkloadEnvironmentPrecedenceAndIsolation(t *testing.T) {
+	t.Setenv("SUPERVISOR_ONLY_TEST", "must-stay-outside")
+	image := []string{"PATH=/usr/local/go/bin:/usr/bin:/bin", "HOME=/image-home", "IMAGE_DEFAULT=present", "PORT=old"}
+	got := workloadEnv(image, []string{"SECRET=app", "PORT=wrong", "PATH=/app/bin:/bin", "HOME=/app/home", "GIT_TOKEN=explicit-app-value"}, 8080)
 	joined := strings.Join(got, "\n")
-	if !strings.Contains(joined, "SECRET=app") || !strings.Contains(joined, "PORT=8080") || strings.Contains(joined, "PORT=wrong") || strings.Contains(joined, "PATH=wrong") {
-		t.Fatalf("%v", got)
+	for _, want := range []string{"SECRET=app", "PORT=8080", "PATH=/app/bin:/bin", "HOME=/app/home", "IMAGE_DEFAULT=present", "GIT_TOKEN=explicit-app-value"} {
+		if !strings.Contains(joined, want) {
+			t.Fatalf("missing %s in %v", want, got)
+		}
 	}
-	if !strings.Contains(joined, "GIT_TOKEN=explicit-app-value") {
-		t.Fatal("an explicitly provided APP_GIT_TOKEN must forward as GIT_TOKEN")
+	if strings.Contains(joined, "PORT=wrong") || strings.Contains(joined, "PORT=old") || strings.Contains(joined, "SUPERVISOR_ONLY_TEST") {
+		t.Fatal("reserved port or supervisor environment leaked:", got)
+	}
+	defaults := strings.Join(workloadEnv(image, nil, 8080), "\n")
+	if !strings.Contains(defaults, "PATH=/usr/local/go/bin:/usr/bin:/bin") || !strings.Contains(defaults, "HOME=/image-home") {
+		t.Fatal("image defaults discarded:", defaults)
+	}
+	if !strings.Contains(strings.Join(workloadEnv(nil, nil, 8080), "\n"), "HOME=/root") {
+		t.Fatal("default HOME is not on the private filesystem")
 	}
 }
 
@@ -213,6 +224,15 @@ func TestDirectRuntimeUsesDistinctPortsAndDockerDNS(t *testing.T) {
 	ports := make(map[int]bool)
 	for _, id := range []string{"old", "candidate"} {
 		bundle := filepath.Join(r.Data, "instances", id)
+		if id == "old" {
+			// An image's absolute /tmp symlink must not become a host bind source.
+			if err := os.MkdirAll(filepath.Join(bundle, "rootfs"), 0700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Symlink(t.TempDir(), filepath.Join(bundle, "rootfs", "tmp")); err != nil {
+				t.Fatal(err)
+			}
+		}
 		i, err := r.start(context.Background(), id, bundle, id, []string{"PORT=wrong"})
 		if err != nil {
 			t.Fatal(err)
@@ -246,8 +266,19 @@ func TestDirectRuntimeUsesDistinctPortsAndDockerDNS(t *testing.T) {
 		if err := json.Unmarshal(b, &spec); err != nil {
 			t.Fatal(err)
 		}
-		found := false
+		found, foundTmp := false, false
 		for _, mount := range spec.Mounts {
+			if mount.Destination == "/tmp" {
+				want, err := filepath.Abs(filepath.Join(bundle, "rootfs", "tmp"))
+				if err != nil || mount.Type != "bind" || mount.Source != want {
+					t.Fatalf("/tmp is not bound to the private disk directory: %+v %v", mount, err)
+				}
+				info, err := os.Lstat(want)
+				if err != nil || !info.IsDir() || info.Mode()&os.ModeSticky == 0 {
+					t.Fatalf("/tmp is not an owned sticky directory: %v %v", info, err)
+				}
+				foundTmp = true
+			}
 			if mount.Destination == "/etc/resolv.conf" {
 				contents, err := os.ReadFile(mount.Source)
 				if err != nil || string(contents) != string(resolver) || !filepath.IsAbs(mount.Source) || !strings.Contains(strings.Join(mount.Options, ","), "ro") {
@@ -256,8 +287,8 @@ func TestDirectRuntimeUsesDistinctPortsAndDockerDNS(t *testing.T) {
 				found = true
 			}
 		}
-		if !found {
-			t.Fatal("runtime did not provide Docker DNS")
+		if !found || !foundTmp {
+			t.Fatal("runtime did not provide Docker DNS and private disk-backed /tmp")
 		}
 	}
 }

@@ -2,6 +2,7 @@ services:
   easy-service:
     build: .
     restart: unless-stopped
+    stop_grace_period: 90s
     ports:
       - "8080:80"
     environment:

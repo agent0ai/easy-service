@@ -12,6 +12,7 @@ services:
   easy-service:
     build: .
     restart: unless-stopped
+    stop_grace_period: 90s
     ports: ["8080:80"]
     environment:
       GIT_URL: https://github.com/you/your-service.git
@@ -43,7 +44,11 @@ application's dependencies and can be omitted if none are needed.
 Commands run in `/app` using `/bin/sh`. Keep the server running in the foreground
 and make it listen on `$PORT`, assigned automatically for each instance. Pass
 application settings as `APP_NAME=value`; the application receives `NAME=value`.
-Git credentials stay in the supervisor.
+Image environment defaults are preserved; `APP_*` overrides them, including
+`PATH` and `HOME`. `PORT` is always assigned by the supervisor. If the image has
+no `HOME`, it defaults to `/root`. Git credentials stay in the supervisor.
+Setup has a 15-minute timeout. Files installed under `$HOME` or `/tmp` survive
+into the running instance; both use its private writable filesystem.
 
 ## Inspect and control
 

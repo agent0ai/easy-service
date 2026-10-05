@@ -12,17 +12,13 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"time"
 
 	"github.com/example/easy-service/internal/process"
 )
 
-type Selection struct {
-	SHA, Name string
-	Time      time.Time
-}
+type Selection struct{ SHA string }
 
 func ValidSHA(sha string) bool {
 	if len(sha) != 40 || sha != strings.ToLower(sha) {
@@ -105,7 +101,7 @@ func (m *Manager) Select(ctx context.Context, method, branch, pattern string) (S
 	switch method {
 	case "commit":
 		s, e := m.Run(op, m.Mirror, "rev-parse", "refs/remotes/origin/"+branch+"^{commit}")
-		return Selection{SHA: s, Name: branch}, e
+		return Selection{SHA: s}, e
 	case "tag":
 		return m.tag(op, pattern)
 	case "release":
@@ -137,21 +133,19 @@ func Match(pattern, name string) bool { // whole-string wildcard
 	return pi == len(pattern)
 }
 func (m *Manager) tag(ctx context.Context, p string) (Selection, error) {
-	out, e := m.Run(ctx, m.Mirror, "for-each-ref", "--sort=-refname", "--sort=-creatordate", "--format=%(refname:strip=2)%09%(creatordate:unix)", "refs/tags")
+	out, e := m.Run(ctx, m.Mirror, "for-each-ref", "--sort=-refname", "--sort=-creatordate", "--format=%(refname:strip=2)", "refs/tags")
 	if e != nil {
 		return Selection{}, e
 	}
-	for _, l := range strings.Split(out, "\n") {
-		f := strings.Split(l, "\t")
-		if len(f) != 2 || !Match(p, f[0]) {
+	for _, name := range strings.Split(out, "\n") {
+		if name == "" || !Match(p, name) {
 			continue
 		}
-		ts, _ := strconv.ParseInt(f[1], 10, 64)
-		resolved, e := m.Run(ctx, m.Mirror, "rev-parse", "refs/tags/"+f[0]+"^{commit}")
+		resolved, e := m.Run(ctx, m.Mirror, "rev-parse", "refs/tags/"+name+"^{commit}")
 		if e != nil {
 			continue
 		}
-		return Selection{resolved, f[0], time.Unix(ts, 0)}, nil
+		return Selection{SHA: resolved}, nil
 	}
 	return Selection{}, fmt.Errorf("no matching tags")
 }
@@ -214,7 +208,7 @@ func (m *Manager) release(ctx context.Context, p string) (Selection, error) {
 		return Selection{}, fmt.Errorf("no matching published releases")
 	}
 	sha, e := m.Run(ctx, m.Mirror, "rev-parse", "refs/tags/"+best.Tag+"^{commit}")
-	return Selection{sha, best.Tag, best.Published}, e
+	return Selection{SHA: sha}, e
 }
 func parseNext(h string) string {
 	for _, p := range strings.Split(h, ",") {

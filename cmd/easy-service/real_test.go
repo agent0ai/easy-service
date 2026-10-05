@@ -4,6 +4,7 @@ import (
 	"context"
 	"flag"
 	"io"
+	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
@@ -66,8 +67,8 @@ func TestRealGVisorLifecycle(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Setenv("SUPERVISOR_ONLY_TEST", "must-stay-outside")
-	cfg := config.Config{DataDir: data, GitURL: origin, RuntimeImage: ref, SetupCommand: "/bin/busybox nslookup example.com >/dev/null && printf prepared > setup-marker", RunCommand: `test "$EXPECTED" = workload-visible && test -z "${SUPERVISOR_ONLY_TEST+x}" && test ! -e .git && test -f setup-marker && test "$(cat index.html)" != bad && exec /bin/busybox httpd -f -p "$PORT" -h /app`, AppEnv: []string{"EXPECTED=workload-visible"}, StartupTimeout: 30 * time.Second, HealthInterval: time.Second, HealthFailures: 3}
-	e := &supervisor.Engine{Cfg: cfg, Runtime: runtimeAdapter{sandbox.Runtime{Data: data, Stdout: os.Stdout, Stderr: os.Stderr}}, Checkout: git, Proxy: proxy.New(), Store: state.Store{Data: data}, Health: health.New(cfg.HealthInterval, "/index.html"), Rootfs: image.Rootfs, Digest: image.Digest, Drain: time.Second, RuntimeContext: ctx, Failures: make(chan uint64, 1)}
+	cfg := config.Config{DataDir: data, GitURL: origin, RuntimeImage: ref, SetupCommand: `/bin/busybox nslookup example.com >/dev/null && mkdir -p "$HOME" && printf prepared > "$HOME/setup-marker" && /bin/busybox dd if=/dev/zero of=/tmp/setup-data bs=1M count=70`, RunCommand: `test "$EXPECTED" = workload-visible && test -z "${SUPERVISOR_ONLY_TEST+x}" && test ! -e .git && test -f "$HOME/setup-marker" && test "$(wc -c </tmp/setup-data)" -eq 73400320 && test "$(cat index.html)" != bad && exec /bin/busybox httpd -f -p "$PORT" -h /app`, AppEnv: []string{"EXPECTED=workload-visible"}, StartupTimeout: 30 * time.Second, HealthInterval: time.Second, HealthFailures: 3}
+	e := &supervisor.Engine{Cfg: cfg, Runtime: runtimeAdapter{sandbox.Runtime{Data: data, ImageEnv: image.Env, Stdout: os.Stdout, Stderr: os.Stderr}}, Checkout: git, Proxy: proxy.New(), Store: state.Store{Data: data}, Health: health.New(cfg.HealthInterval, "/index.html"), Rootfs: image.Rootfs, Digest: image.Digest, Drain: time.Second, RuntimeContext: ctx, Failures: make(chan uint64, 1)}
 	t.Cleanup(func() { e.Shutdown(context.Background()) })
 	front := httptest.NewServer(e.Proxy)
 	defer front.Close()
@@ -109,5 +110,70 @@ func TestRealGVisorLifecycle(t *testing.T) {
 		if res.StatusCode == 200 {
 			t.Fatal("reconciliation left the direct runsc workload serving")
 		}
+	}
+}
+
+func TestRealGoImageEnvironmentAndSetup(t *testing.T) {
+	if !*realGVisor {
+		t.Skip("enable with -args -real-gvisor on a supported host")
+	}
+	if os.Geteuid() == 0 {
+		t.Fatal("run the real rootless lifecycle test as an unprivileged user")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+	images := imagepkg.Manager{Data: t.TempDir(), Runner: process.Runner{}}
+	image, err := images.Prepare(ctx, "golang:1.27.1-bookworm")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := images.Prune(image); err != nil {
+		t.Fatal(err)
+	}
+	checkout := t.TempDir()
+	source := `package main
+import ("fmt"; "net/http"; "os")
+func main() {
+ if _, err := os.Stat(os.Getenv("HOME")+"/install-marker"); err != nil { panic(err) }
+ if os.Getenv("SUPERVISOR_ONLY_TEST") != "" { panic("supervisor environment leaked") }
+ http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) { fmt.Fprint(w, os.Getenv("MESSAGE")) })
+ panic(http.ListenAndServe(":"+os.Getenv("PORT"), nil))
+}
+`
+	for name, contents := range map[string]string{"go.mod": "module example.test/service\n\ngo 1.23\n", "main.go": source} {
+		if err := os.WriteFile(filepath.Join(checkout, name), []byte(contents), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Setenv("SUPERVISOR_ONLY_TEST", "must-stay-outside")
+	rt := sandbox.Runtime{Data: images.Data, ImageEnv: image.Env, Stdout: os.Stdout, Stderr: os.Stderr}
+	env := []string{"HOME=/app/home", "MESSAGE=go-ready"}
+	prepared, err := rt.Prepare(ctx, "go-image", image.Rootfs, checkout, `mkdir -p bin && go build -o bin/server . && printf installed > "$HOME/install-marker"`, env)
+	if err != nil {
+		t.Fatal(err)
+	}
+	instance, err := rt.Start(ctx, ctx, "go-server", prepared, "exec ./bin/server", env)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		stop, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if err := instance.Stop(stop); err != nil {
+			t.Error(err)
+		}
+	}()
+	if err := health.New(time.Second, "/").Ready(ctx, instance.Endpoint(), instance, 30*time.Second); err != nil {
+		t.Fatal(err)
+	}
+	client := &http.Client{Timeout: 3 * time.Second}
+	response, err := client.Get(instance.Endpoint())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	body, err := io.ReadAll(response.Body)
+	if err != nil || string(body) != "go-ready" {
+		t.Fatalf("real Go service response: %q %v", body, err)
 	}
 }

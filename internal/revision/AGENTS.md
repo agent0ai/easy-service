@@ -9,7 +9,7 @@ Select exact Git revisions and produce detached application checkouts.
 
 ## Local Contracts
 
-- Deploy only lowercase, 40-character hexadecimal commit SHAs; remove checkout Git metadata.
+- Return only the selected lowercase, 40-character hexadecimal commit SHA; remove checkout Git metadata. Tag/release names and timestamps remain local selection inputs, not downstream deployment fields.
 - Local working and bare repositories support commit/tag modes; only committed content is deployed.
 - For local sources mounted across UIDs, pass exact repository and `.git` trust to Git's local `upload-pack` through its native fetch option. Git clears inherited command configuration before spawning that helper. Do not use wildcard/global trust or forward GitHub authentication to local helpers.
 - Tag order is creator time, then tag name descending; releases exclude drafts/prereleases and order by publication time/name.

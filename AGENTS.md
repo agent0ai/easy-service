@@ -102,6 +102,9 @@ The root owns README.md, Dockerfile, compose.yaml, Makefile, go.mod, .gitignore 
 - Docker runtime packaging retains runsc and its companion helpers while excluding the unused containerd shim; this service launches runsc directly.
 - The same Docker binary starts the supervisor without arguments and provides `status`, `redeploy`, `restart` and `help` subcommands. Control stays on a private Unix socket under DATA_DIR.
 - Runtime images default to `debian:bookworm-slim`; use Skopeo's native Docker image-name handling for shorthand names.
+- Preserve image environment defaults and explicit APP_* overrides, reserving only PORT; HOME defaults to /root. Setup writes in HOME and /tmp stay on the private writable filesystem.
+- After image selection at startup, discard source archives and stale image caches while retaining the selected filesystem and OCI environment configuration for offline recovery.
+- Compose grants ninety seconds for outer-container shutdown so the supervisor can finish request drain and sandbox cleanup.
 - Tagged Docker publication requires GitHub Actions secrets `DOCKERHUB_ORG` and `DOCKERHUB_OAT_TOKEN`; Git tags are preserved exactly and no `latest` tag is published.
 - Follow the nearest child verification instructions for local edits. Documentation-only changes require link/index and source-contract review.
 

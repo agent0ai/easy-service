@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"testing"
 	"time"
 
@@ -39,8 +40,11 @@ func TestRealRootlessOCI(t *testing.T) {
 	if _, err := os.ReadFile(filepath.Join(p.Rootfs, "etc", "alpine-release")); err != nil {
 		t.Fatal(err)
 	}
+	if err := m.Prune(p); err != nil {
+		t.Fatal(err)
+	}
 	cached, err := m.Cached(ref, p.Digest)
-	if err != nil || cached != p {
+	if err != nil || !reflect.DeepEqual(cached, p) {
 		t.Fatalf("cache mismatch: %+v %v", cached, err)
 	}
 }

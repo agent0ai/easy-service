@@ -512,7 +512,7 @@ func TestCachedRevisionRecoveryRetriesWithoutGit(t *testing.T) {
 	r.failStarts = 1
 	e.Cfg.PollInterval = time.Hour
 	e.Cfg.HealthInterval = 3 * time.Millisecond
-	initial := revision.Selection{SHA: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", Name: "recovery"}
+	initial := revision.Selection{SHA: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}
 	c := Controller{Cfg: e.Cfg, Selector: failingSelector{}, Engine: e, Initial: &initial}
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})

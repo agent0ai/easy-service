@@ -64,6 +64,7 @@ type Instance struct {
 }
 type Runtime struct {
 	Data           string
+	ImageEnv       []string
 	Stdout, Stderr io.Writer
 }
 
@@ -258,7 +259,25 @@ func (r Runtime) start(ctx context.Context, id, bundle, command string, env []st
 	if e := l.Close(); e != nil {
 		return nil, e
 	}
-	spec := Spec{OCIVersion: "1.0.2", Process: Process{User: User{0, 0}, Args: []string{"/bin/sh", "-c", command}, Env: workloadEnv(env, port), Cwd: "/app", NoNewPrivileges: true}, Root: Root{"rootfs", false}, Mounts: []Mount{{"/proc", "proc", "proc", nil}, {"/dev", "tmpfs", "tmpfs", []string{"nosuid", "strictatime", "mode=755", "size=65536k"}}, {"/tmp", "tmpfs", "tmpfs", []string{"nosuid", "nodev", "mode=1777", "size=64m"}}}, Linux: Linux{[]Namespace{{"pid"}, {"ipc"}, {"uts"}, {"mount"}}}}
+	tmp, e := filepath.Abs(filepath.Join(bundle, "rootfs", "tmp"))
+	if e != nil {
+		return nil, e
+	}
+	// Bind our own disk directory: runsc overlays an otherwise empty /tmp
+	// with an internal tmpfs. Never follow an image symlink on the host.
+	if st, e := os.Lstat(tmp); e == nil && st.Mode()&os.ModeSymlink != 0 {
+		if e := os.Remove(tmp); e != nil {
+			return nil, e
+		}
+	}
+	if e := os.MkdirAll(tmp, 0700); e != nil {
+		return nil, e
+	}
+	if e := os.Chmod(tmp, 0777|os.ModeSticky); e != nil {
+		return nil, e
+	}
+	spec := Spec{OCIVersion: "1.0.2", Process: Process{User: User{0, 0}, Args: []string{"/bin/sh", "-c", command}, Env: workloadEnv(r.ImageEnv, env, port), Cwd: "/app", NoNewPrivileges: true}, Root: Root{"rootfs", false}, Mounts: []Mount{{"/proc", "proc", "proc", nil}, {"/dev", "tmpfs", "tmpfs", []string{"nosuid", "strictatime", "mode=755", "size=65536k"}}}, Linux: Linux{[]Namespace{{"pid"}, {"ipc"}, {"uts"}, {"mount"}}}}
+	spec.Mounts = append(spec.Mounts, Mount{"/tmp", "bind", tmp, []string{"bind", "nosuid", "nodev"}})
 	// Share Docker's DNS configuration without exposing its writable host file.
 	dns, e := filepath.Abs(filepath.Join(bundle, "resolv.conf"))
 	if e != nil {
@@ -291,15 +310,15 @@ func (r Runtime) start(ctx context.Context, id, bundle, command string, env []st
 	go func() { i.waitErr = process.Wait(cmd); close(i.done) }()
 	return i, nil
 }
-func workloadEnv(app []string, servicePort int) []string {
-	values := map[string]string{}
-	for _, item := range app {
-		if at := strings.IndexByte(item, '='); at > 0 {
-			values[item[:at]] = item[at+1:]
+func workloadEnv(image, app []string, servicePort int) []string {
+	values := map[string]string{"PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin", "HOME": "/root"}
+	for _, source := range [][]string{image, app} {
+		for _, item := range source {
+			if at := strings.IndexByte(item, '='); at > 0 {
+				values[item[:at]] = item[at+1:]
+			}
 		}
 	}
-	values["PATH"] = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
-	values["HOME"] = "/tmp"
 	values["PORT"] = strconv.Itoa(servicePort)
 	keys := make([]string, 0, len(values))
 	for key := range values {

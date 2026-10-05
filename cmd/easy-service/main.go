@@ -78,7 +78,7 @@ func run(ctx context.Context, cfg config.Config, p *proxy.Proxy, serverDrained <
 	defer cancelRuntime()
 	store := state.Store{Data: cfg.DataDir}
 	git := revision.New(cfg.GitURL, cfg.GitToken, cfg.DataDir)
-	rt := runtimeAdapter{sandbox.Runtime{Data: cfg.DataDir, Stdout: os.Stdout, Stderr: os.Stderr}}
+	rt := &runtimeAdapter{sandbox.Runtime{Data: cfg.DataDir, Stdout: os.Stdout, Stderr: os.Stderr}}
 	engine := &supervisor.Engine{Cfg: cfg, Runtime: rt, Checkout: git, Proxy: p, Store: store, Health: health.New(cfg.HealthInterval, cfg.HealthPath), Drain: 30 * time.Second, RuntimeContext: runtimeCtx, Failures: make(chan uint64, 1), MemoryExceeded: make(chan uint64, 1)}
 	controller := &supervisor.Controller{Cfg: cfg, Selector: git, Engine: engine}
 	closeControl, err := controller.StartControl(ctx)
@@ -108,9 +108,13 @@ func run(ctx context.Context, cfg config.Config, p *proxy.Proxy, serverDrained <
 		case <-time.After(cfg.HealthInterval):
 		}
 	}
+	if err := images.Prune(prepared); err != nil {
+		log.Printf("image cache cleanup failed: %v", err)
+	}
+	rt.ImageEnv = prepared.Env
 	engine.Rootfs, engine.Digest = prepared.Rootfs, prepared.Digest
 	if prior.Recoverable(cfg.GitURL, cfg.RuntimeImage) {
-		controller.Initial = &revision.Selection{SHA: prior.Revision, Name: "recovery"}
+		controller.Initial = &revision.Selection{SHA: prior.Revision}
 	}
 	controller.Run(ctx)
 	<-serverDrained

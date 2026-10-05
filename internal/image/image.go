@@ -22,7 +22,10 @@ type Manager struct {
 	Data   string
 	Runner Runner
 }
-type Prepared struct{ Digest, Rootfs string }
+type Prepared struct {
+	Digest, Rootfs string
+	Env            []string `json:"-"`
+}
 
 func (m Manager) Cached(ref, digest string) (Prepared, error) {
 	if !validDigest(digest) {
@@ -41,10 +44,51 @@ func (m Manager) Cached(ref, digest string) (Prepared, error) {
 	if st, e := os.Stat(p.Rootfs); e != nil || !st.IsDir() {
 		return Prepared{}, fmt.Errorf("cached image rootfs unavailable")
 	}
+	b, e = os.ReadFile(filepath.Join(dir, "bundle", "config.json"))
+	if e != nil {
+		return Prepared{}, fmt.Errorf("read runtime image configuration: %w", e)
+	}
+	var spec struct {
+		Process struct{ Env []string }
+	}
+	if e = json.Unmarshal(b, &spec); e != nil {
+		return Prepared{}, fmt.Errorf("parse runtime image configuration: %w", e)
+	}
+	p.Env = spec.Process.Env
 	return p, nil
 }
 
-func (m Manager) Prepare(ctx context.Context, ref string) (Prepared, error) {
+// Prune runs after startup has selected its usable image, including offline recovery.
+func (m Manager) Prune(keep Prepared) error {
+	root := filepath.Join(m.Data, "images")
+	dir := filepath.Dir(filepath.Dir(keep.Rootfs))
+	if !state.Within(root, dir) || filepath.Dir(dir) != root || keep.Rootfs != filepath.Join(dir, "bundle", "rootfs") {
+		return fmt.Errorf("unsafe image cache cleanup path")
+	}
+	if st, e := os.Stat(keep.Rootfs); e != nil || !st.IsDir() {
+		return fmt.Errorf("selected image rootfs unavailable")
+	}
+	entries, e := os.ReadDir(root)
+	if e != nil {
+		return e
+	}
+	for _, entry := range entries {
+		path := filepath.Join(root, entry.Name())
+		if path != dir {
+			if e := os.RemoveAll(path); e != nil {
+				return e
+			}
+		}
+	}
+	for _, name := range []string{"oci", "copied-digest"} {
+		if e := os.RemoveAll(filepath.Join(dir, name)); e != nil {
+			return e
+		}
+	}
+	return nil
+}
+
+func (m Manager) Prepare(ctx context.Context, ref string) (p Prepared, err error) {
 	digest, e := m.Runner.Run(ctx, 10*time.Minute, "skopeo", "inspect", "--no-tags", "--override-os", "linux", "--override-arch", runtime.GOARCH, "--format", "{{.Digest}}", "docker://"+ref)
 	if e != nil {
 		return Prepared{}, fmt.Errorf("resolve runtime image: %w", e)
@@ -69,6 +113,11 @@ func (m Manager) Prepare(ctx context.Context, ref string) (Prepared, error) {
 	if e := os.MkdirAll(dir, 0700); e != nil {
 		return Prepared{}, e
 	}
+	defer func() {
+		if err != nil {
+			_ = os.RemoveAll(dir)
+		}
+	}()
 	layout := filepath.Join(dir, "oci")
 	bundle := filepath.Join(dir, "bundle")
 	immutable := ref
@@ -81,7 +130,6 @@ func (m Manager) Prepare(ctx context.Context, ref string) (Prepared, error) {
 	immutable += "@" + digest
 	copiedDigestFile := filepath.Join(dir, "copied-digest")
 	if _, e = m.Runner.Run(ctx, 10*time.Minute, "skopeo", "copy", "--digestfile", copiedDigestFile, "--override-os", "linux", "--override-arch", runtime.GOARCH, "docker://"+immutable, "oci:"+layout+":runtime"); e != nil {
-		os.RemoveAll(dir)
 		return Prepared{}, fmt.Errorf("pull runtime image: %w", e)
 	}
 	copied, inspectErr := m.Runner.Run(ctx, 10*time.Minute, "skopeo", "inspect", "--format", "{{.Digest}}", "oci:"+layout+":runtime")
@@ -89,19 +137,17 @@ func (m Manager) Prepare(ctx context.Context, ref string) (Prepared, error) {
 	// records the copied manifest's digest; it need not equal the source index.
 	expected, digestErr := os.ReadFile(copiedDigestFile)
 	if inspectErr != nil || digestErr != nil || !validDigest(strings.TrimSpace(string(expected))) || strings.TrimSpace(copied) != strings.TrimSpace(string(expected)) {
-		os.RemoveAll(dir)
 		return Prepared{}, fmt.Errorf("copied runtime image digest verification failed")
 	}
 	if _, e = m.Runner.Run(ctx, 10*time.Minute, "umoci", "unpack", "--rootless", "--image", layout+":runtime", bundle); e != nil {
-		os.RemoveAll(dir)
 		return Prepared{}, fmt.Errorf("unpack runtime image: %w", e)
 	}
-	p := Prepared{digest, root}
+	p = Prepared{Digest: digest, Rootfs: root}
 	b, _ := json.Marshal(p)
 	if e := state.AtomicWrite(meta, b); e != nil {
 		return Prepared{}, e
 	}
-	return p, nil
+	return m.Cached(ref, digest)
 }
 
 func validDigest(digest string) bool {

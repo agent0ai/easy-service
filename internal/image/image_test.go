@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -26,6 +27,10 @@ func (f *fake) Run(_ context.Context, _ time.Duration, n string, a ...string) (s
 		return sourceDigest + "\n", nil
 	}
 	if n == "skopeo" && a[0] == "copy" {
+		layout := strings.TrimSuffix(strings.TrimPrefix(a[len(a)-1], "oci:"), ":runtime")
+		if err := os.MkdirAll(filepath.Join(layout, "blobs"), 0700); err != nil {
+			return "", err
+		}
 		for i, arg := range a {
 			if arg == "--digestfile" {
 				return "", os.WriteFile(a[i+1], []byte(copiedDigest), 0600)
@@ -39,7 +44,10 @@ func (f *fake) Run(_ context.Context, _ time.Duration, n string, a ...string) (s
 		}
 		for _, x := range a {
 			if strings.HasSuffix(x, "/bundle") {
-				os.MkdirAll(filepath.Join(x, "rootfs"), 0700)
+				if err := os.MkdirAll(filepath.Join(x, "rootfs"), 0700); err != nil {
+					return "", err
+				}
+				return "", os.WriteFile(filepath.Join(x, "config.json"), []byte(`{"process":{"env":["PATH=/usr/local/go/bin:/usr/bin:/bin","IMAGE_DEFAULT=present"]}}`), 0600)
 			}
 		}
 	}
@@ -52,7 +60,7 @@ func TestDigestArchitectureCacheAndPreparation(t *testing.T) {
 	if e != nil {
 		t.Fatal(e)
 	}
-	if p.Digest != sourceDigest || len(f.calls) != 4 {
+	if p.Digest != sourceDigest || len(f.calls) != 4 || !reflect.DeepEqual(p.Env, []string{"PATH=/usr/local/go/bin:/usr/bin:/bin", "IMAGE_DEFAULT=present"}) {
 		t.Fatalf("%+v %v", p, f.calls)
 	}
 	if _, e = m.Prepare(context.Background(), "example/app:latest"); e != nil {
@@ -66,6 +74,46 @@ func TestDigestArchitectureCacheAndPreparation(t *testing.T) {
 	}
 	if !strings.Contains(f.calls[1], "docker://example/app@"+sourceDigest) {
 		t.Fatalf("copy did not use immutable digest: %v", f.calls)
+	}
+}
+
+func TestPruneKeepsSelectedImageAndOfflineEnvironment(t *testing.T) {
+	m := Manager{Data: t.TempDir(), Runner: &fake{}}
+	old, err := m.Prepare(context.Background(), "example/app:old")
+	if err != nil {
+		t.Fatal(err)
+	}
+	current, err := m.Prepare(context.Background(), "example/app:new")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Prune(Prepared{Rootfs: t.TempDir()}); err == nil {
+		t.Fatal("unsafe cleanup path accepted")
+	}
+	if err := m.Prune(current); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(old.Rootfs); !os.IsNotExist(err) {
+		t.Fatal("stale image cache retained:", err)
+	}
+	for _, name := range []string{"oci", "copied-digest"} {
+		if _, err := os.Stat(filepath.Join(filepath.Dir(filepath.Dir(current.Rootfs)), name)); !os.IsNotExist(err) {
+			t.Fatal("unused image source retained:", name, err)
+		}
+	}
+	cached, err := m.Cached("example/app:new", sourceDigest)
+	if err != nil || !reflect.DeepEqual(cached, current) {
+		t.Fatalf("offline environment lost after pruning: %+v %v", cached, err)
+	}
+	// A failed new image must leave the selected cache available for recovery.
+	m.Runner = runnerFunc(func(context.Context, time.Duration, string, ...string) (string, error) {
+		return "", errors.New("registry unavailable")
+	})
+	if _, err := m.Prepare(context.Background(), "example/app:new"); err == nil {
+		t.Fatal("registry failure ignored")
+	}
+	if recovered, err := m.Cached("example/app:new", sourceDigest); err != nil || !reflect.DeepEqual(recovered, current) {
+		t.Fatalf("offline image recovery failed: %+v %v", recovered, err)
 	}
 }
 
@@ -87,7 +135,7 @@ func (f runnerFunc) Run(ctx context.Context, limit time.Duration, n string, a ..
 }
 
 func TestCopiedDigestMismatchAndUnpackFailureRemovePartialCache(t *testing.T) {
-	for _, phase := range []string{"digest", "unpack"} {
+	for _, phase := range []string{"digest", "unpack", "config"} {
 		t.Run(phase, func(t *testing.T) {
 			base := &fake{}
 			m := Manager{Data: t.TempDir(), Runner: runnerFunc(func(ctx context.Context, limit time.Duration, n string, a ...string) (string, error) {
@@ -97,7 +145,11 @@ func TestCopiedDigestMismatchAndUnpackFailureRemovePartialCache(t *testing.T) {
 				if phase == "unpack" && n == "umoci" {
 					return "", errors.New("unpack failed")
 				}
-				return base.Run(ctx, limit, n, a...)
+				out, err := base.Run(ctx, limit, n, a...)
+				if phase == "config" && n == "umoci" && err == nil {
+					err = os.WriteFile(filepath.Join(a[len(a)-1], "config.json"), []byte("invalid-json"), 0600)
+				}
+				return out, err
 			})}
 			if _, err := m.Prepare(context.Background(), "registry.invalid:5000/app:tag"); err == nil {
 				t.Fatal("broken cache accepted")
