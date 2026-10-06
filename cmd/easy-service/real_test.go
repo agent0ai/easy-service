@@ -144,6 +144,15 @@ func TestRealConfigurationCLIAndRestart(t *testing.T) {
 	}
 	cli("config", "apply")
 	wait(func() bool { return served("one") })
+	exported := cli("config", "show")
+	imported := exec.CommandContext(ctx, binary, "config", "set")
+	imported.Env, imported.Stdin = env, strings.NewReader(exported)
+	if b, err := imported.CombinedOutput(); err != nil || string(b) != exported {
+		t.Fatalf("real CLI copy/paste did not preserve settings: %v %s", err, b)
+	}
+	if !served("one") {
+		t.Fatal("import deployed pending settings")
+	}
 	oldFiles, err := os.ReadDir(logDir)
 	if err != nil || len(oldFiles) == 0 {
 		t.Fatalf("no app output captured: %v", err)

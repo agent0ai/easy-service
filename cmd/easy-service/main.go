@@ -31,7 +31,7 @@ func (r runtimeAdapter) Restart(c context.Context, a, b, d string, e []string) (
 }
 func main() {
 	if len(os.Args) > 1 {
-		if err := cli(os.Args[1:], os.Stdout); err != nil {
+		if err := cli(os.Args[1:], os.Stdin, os.Stdout); err != nil {
 			fmt.Fprintln(os.Stderr, err)
 			os.Exit(1)
 		}

@@ -91,7 +91,7 @@ Default section order:
 - [cmd/AGENTS.md](cmd/AGENTS.md): executable wiring, container CLI, runtime adapter and process shutdown.
 - [internal/AGENTS.md](internal/AGENTS.md): package boundaries, deployment flow and ten package-specific child contracts.
 - [scripts/AGENTS.md](scripts/AGENTS.md): repository contract checks.
-- [.github/AGENTS.md](.github/AGENTS.md): tagged multi-platform Docker publication.
+- [.github/AGENTS.md](.github/AGENTS.md): manual and highest-version multi-platform Docker publication.
 
 The root owns README.md, Dockerfile, compose.yaml, Makefile, go.mod, .gitignore and DOX-LICENSE. Child docs own their named subtrees.
 
@@ -99,7 +99,7 @@ The root owns README.md, Dockerfile, compose.yaml, Makefile, go.mod, .gitignore 
 
 - easy-service supervises stateless HTTP workloads selected from Git, installed in rootless gVisor sandboxes and exposed on port 80.
 - README.md is the public configuration, deployment and lifecycle reference. Keep it aligned with implementation.
-- Run `make check` with Go 1.23 or later: formatting, vet, race tests and `scripts/contract-test.sh`.
+- Run `make check` with Go 1.23 or later and Python 3: formatting, vet, race tests, `scripts/contract-test.sh` and Docker publication policy tests.
 - Cross-package tests may fake owned external boundaries; real OCI/gVisor and Docker build checks require their documented tools and host prerequisites.
 - Docker runtime packaging retains runsc and its companion helpers while excluding the unused containerd shim; this service launches runsc directly.
 - The same Docker binary starts the supervisor without arguments and provides `status`, `redeploy`, `restart`, `kill-draining`, `config` and `help` subcommands. Control stays on a private Unix socket under DATA_DIR.
@@ -110,7 +110,7 @@ The root owns README.md, Dockerfile, compose.yaml, Makefile, go.mod, .gitignore 
 - Logs live in LOG_DIR and survive instance cleanup, defaulting to thirty days, 10 MiB pages and 1 GiB combined. Short random instance IDs remain unique against live runtimes and retained logs.
 - Discard source archives and stale image/Git caches only after usable selection or return to the previously accepted deployment; preserve offline recovery inputs.
 - Compose grants ninety seconds for outer-container shutdown so the supervisor can finish request drain and sandbox cleanup.
-- Tagged Docker publication requires GitHub Actions secrets `DOCKERHUB_ORG` and `DOCKERHUB_OAT_TOKEN`; Git tags are preserved exactly and no `latest` tag is published.
+- Docker publication requires GitHub Actions secrets `DOCKERHUB_ORG` and `DOCKERHUB_OAT_TOKEN`. Automatic builds select only the highest stable version tag; manual builds accept a Git tag or commit hash. Preserve the selected Docker tag and update `latest` only for the highest stable version.
 - Follow the nearest child verification instructions for local edits. Documentation-only changes require link/index and source-contract review.
 
 ## GitHub Authentication

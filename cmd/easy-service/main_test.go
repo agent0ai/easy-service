@@ -49,7 +49,7 @@ func TestExistingControlOwnerPreventsReconciliation(t *testing.T) {
 		t.Fatalf("second supervisor reached state reconciliation: %v", err)
 	}
 	t.Setenv("DATA_DIR", data)
-	if err := cli([]string{"status"}, io.Discard); err != nil {
+	if err := cli([]string{"status"}, strings.NewReader(""), io.Discard); err != nil {
 		t.Fatal("second supervisor replaced the original control socket:", err)
 	}
 }

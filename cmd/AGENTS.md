@@ -21,6 +21,7 @@ Own the supervisor executable and its process lifetime.
 - Bind the private control socket before reconciliation or image preparation, refusing a second live supervisor for the same DATA_DIR before it mutates owned state. Status/show remain available during candidate work; initialization and actions run in the controller.
 - Actions use the existing serialized controller; CLI requests do not own sandbox or watcher lifetime.
 - The CLI uses DATA_DIR (default /data), reports action failures with a nonzero exit status, and prints status without exposing Git credentials or application environment. Explicit config show prints managed values; set requires NAME=value batches and rejects malformed batches before sending them, unset restores defaults, and apply activates pending changes.
+- Show and successful set output sorted NAME=value lines without headings, quoting/escaping whitespace, quotes and backslashes to keep each value on one physical line. Set without arguments reads that format from stdin, decodes quoted values without shell expansion, accepts blank lines/CRLF and rejects malformed, duplicate, unreadable or oversized input before sending the batch. Argument values remain literal after normal shell parsing.
 - Boot first with Docker defaults plus accepted CONFIG_DIR overrides; load only directory defaults before saved overrides so an overridden invalid Docker value cannot block startup. Missing Git/run settings keep the CLI available.
 - Create /data, /config and /logs as UID 10000-owned writable directories in the image; require no Dockerfile VOLUME or default Compose volume mapping.
 - Wire one log manager to setup/running instance output; lifecycle events log names/identity, never configuration values.
@@ -34,6 +35,7 @@ Own the supervisor executable and its process lifetime.
 
 - `go test -race ./cmd/easy-service` checks reconciliation error propagation.
 - `TestCLICommandsOverUnixSocket` checks CLI command methods, readable status, argument validation, action failures and missing-supervisor errors without requiring deployment configuration.
+- `TestConfigTextRoundTrip` checks exported values through stdin import and durable staging over a real control socket, including quoting, whitespace, newlines and literal shell syntax.
 - `TestExistingControlOwnerPreventsReconciliation` checks that a second supervisor cannot reach state reconciliation or replace the existing live control socket.
 - `make check` covers wiring and cross-package contracts.
 - As an unprivileged user with the documented tools/host prerequisites: `go test ./cmd/easy-service -run 'TestReal(GVisorLifecycle|GoImageEnvironmentAndSetup)' -timeout 10m -v -args -real-gvisor`.

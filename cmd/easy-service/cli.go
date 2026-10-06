@@ -16,16 +16,18 @@ import (
 	"strings"
 	"syscall"
 	"time"
+	"unicode"
 
 	"github.com/example/easy-service/internal/supervisor"
 )
 
-func cli(args []string, out io.Writer) error {
+func cli(args []string, in io.Reader, out io.Writer) error {
 	if len(args) == 0 {
 		return fmt.Errorf("usage: easy-service [status|redeploy|restart|kill-draining|config|help]")
 	}
 	action := args[0]
 	var requestBody io.Reader
+	var setValues map[string]string
 	path := "/" + action
 	configShow, staged := false, false
 	if action == "config" {
@@ -45,26 +47,55 @@ func cli(args []string, out io.Writer) error {
 			staged = true
 			action = "config"
 			path = "/config"
-			if len(args) == 2 {
-				return fmt.Errorf("config %s requires variables", args[1])
+			items := args[2:]
+			fromInput := args[1] == "set" && len(items) == 0
+			if fromInput {
+				body, err := io.ReadAll(io.LimitReader(in, (1<<20)+1))
+				if err != nil {
+					return fmt.Errorf("read configuration input: %w", err)
+				}
+				if len(body) > 1<<20 {
+					return fmt.Errorf("configuration input exceeds 1 MiB")
+				}
+				items = strings.Split(string(body), "\n")
 			}
 			patch := struct {
 				Values map[string]string `json:"values,omitempty"`
 				Unset  []string          `json:"unset,omitempty"`
 			}{Values: map[string]string{}}
 			if args[1] == "unset" {
-				patch.Unset = args[2:]
+				if len(items) == 0 {
+					return fmt.Errorf("config unset requires variables")
+				}
+				patch.Unset = items
 			} else {
-				for i := 2; i < len(args); i++ {
-					name, value, ok := strings.Cut(args[i], "=")
-					if !ok {
+				for _, item := range items {
+					if fromInput {
+						item = strings.TrimSuffix(item, "\r")
+						if strings.TrimSpace(item) == "" {
+							continue
+						}
+					}
+					name, value, ok := strings.Cut(item, "=")
+					if !ok || name == "" {
 						return fmt.Errorf("config set requires NAME=value arguments")
+					}
+					if fromInput && strings.HasPrefix(value, `"`) {
+						var err error
+						value, err = strconv.Unquote(value)
+						if err != nil {
+							return fmt.Errorf("invalid quoted value for %s", name)
+						}
 					}
 					if _, duplicate := patch.Values[name]; duplicate {
 						return fmt.Errorf("duplicate variable %q", name)
 					}
 					patch.Values[name] = value
 				}
+				if len(patch.Values) == 0 {
+					return fmt.Errorf("config set requires NAME=value assignments")
+				}
+				setValues = patch.Values
 			}
 			body, err := json.Marshal(patch)
 			if err != nil {
@@ -84,7 +115,7 @@ func cli(args []string, out io.Writer) error {
 	}
 	switch action {
 	case "help", "--help", "-h":
-		_, err := fmt.Fprintln(out, "easy-service                 Start the supervisor\neasy-service status          Show the running revision and memory usage\neasy-service redeploy        Check Git now and deploy, even if unchanged\neasy-service restart         Restart the current writable installation\neasy-service kill-draining    Immediately kill all retired instances\neasy-service config show [NAME...]  Show all or selected pending settings\neasy-service config set NAME=value...  Save pending settings without deploying\neasy-service config unset NAME...  Remove overrides and use Docker defaults\neasy-service config apply     Validate and activate pending settings")
+		_, err := fmt.Fprintln(out, "easy-service                 Start the supervisor\neasy-service status          Show the running revision and memory usage\neasy-service redeploy        Check Git now and deploy, even if unchanged\neasy-service restart         Restart the current writable installation\neasy-service kill-draining    Immediately kill all retired instances\neasy-service config show [NAME...]  Show all or selected pending settings\neasy-service config set [NAME=value...]  Stage arguments or read show-format lines from stdin; apply separately\neasy-service config unset NAME...  Remove overrides and use Docker defaults\neasy-service config apply     Validate and activate pending settings")
 		return err
 	case "status", "redeploy", "restart", "kill-draining", "config", "apply":
 	default:
@@ -144,27 +175,16 @@ func cli(args []string, out io.Writer) error {
 		if err := json.NewDecoder(io.LimitReader(response.Body, 1<<20)).Decode(&values); err != nil {
 			return err
 		}
-		names := make([]string, 0, len(values))
-		for name := range values {
-			names = append(names, name)
-		}
-		sort.Strings(names)
-		for _, name := range names {
-			value := values[name]
-			if strings.ContainsAny(value, "\r\n") {
-				value = strconv.Quote(value)
-			}
-			if _, err := fmt.Fprintf(out, "%s=%s\n", name, value); err != nil {
-				return err
-			}
-		}
-		return nil
+		return printSettings(out, values)
 	}
 	var status supervisor.Status
 	if err := json.NewDecoder(io.LimitReader(response.Body, 1<<20)).Decode(&status); err != nil {
 		return err
 	}
 	if staged {
+		if setValues != nil {
+			return printSettings(out, setValues)
+		}
 		_, err := fmt.Fprintln(out, "Settings saved. Run easy-service config apply to activate them.")
 		return err
 	}
@@ -189,4 +209,24 @@ func cli(args []string, out io.Writer) error {
 	}
 	_, err = out.Write(report)
 	return err
+}
+
+func printSettings(out io.Writer, values map[string]string) error {
+	names := make([]string, 0, len(values))
+	for name := range values {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		value := values[name]
+		if strings.IndexFunc(value, func(r rune) bool {
+			return r == '"' || r == '\\' || unicode.IsSpace(r) || unicode.IsControl(r)
+		}) >= 0 {
+			value = strconv.Quote(value)
+		}
+		if _, err := fmt.Fprintf(out, "%s=%s\n", name, value); err != nil {
+			return err
+		}
+	}
+	return nil
 }

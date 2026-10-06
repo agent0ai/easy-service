@@ -83,11 +83,28 @@ easy-service config set SERVICE_MEMORY_LIMIT=768M HEALTH_FAILURES=5
 easy-service config apply
 ```
 
-`show` prints all settings, including their values, or only the names you list.
-It shows pending settings. `set` requires `NAME=value` arguments and
+`show` prints all pending settings, or only the names you list, as sorted
+`NAME=value` lines without headings. Values containing whitespace, quotes or
+backslashes are quoted and escaped so each stays on one line. Successful `set`
+prints the changed settings in the same format. `set` accepts `NAME=value` arguments and
 saves the whole batch without changing the running service. Set several batches,
 then run `apply` once. `config unset NAME...` removes saved overrides and restores
 the values supplied by Docker, or the built-in defaults.
+
+To copy settings, paste the output from `show` into `set` on the other container:
+
+```sh
+easy-service config set <<'EOF'
+APP_API_KEY=your-key
+RUN_COMMAND="exec ./bin/gateway -env ''"
+EOF
+easy-service config apply
+```
+
+Without arguments, `set` reads one assignment per line until end of input.
+It restores escaped values exactly and never expands shell expressions. You can
+also pipe `config show` into `config set`. When copying all settings, directory
+values must match the target container's Docker configuration.
 
 `apply` validates the settings together. App variables, commands, runtime image
 and Git selection changes start a candidate, check readiness, switch traffic,
@@ -198,11 +215,29 @@ setup is required. Startup fails if the host cannot provide gVisor.
 
 ## Development
 
-Run `make check` with Go 1.23+. The [DOX instructions](AGENTS.md) document each
-package's ownership and tests, including optional real OCI/gVisor and load checks.
+Run `make check` with Go 1.23+ and Python 3. The [DOX instructions](AGENTS.md)
+document each package's ownership and tests, including optional real OCI/gVisor
+and load checks.
 
-Git tags publish Docker images as `agent0ai/easy-service:<git-tag>` for amd64 and
-arm64. You can use a published tag in Portainer instead of `build: .`.
+Pushing the highest version tag publishes `agent0ai/easy-service:<git-tag>` for
+amd64 and arm64, plus `agent0ai/easy-service:latest`. Versions are compared as
+numbers: `v0.1.10` is newer than `v0.1.9`. Older tag pushes are skipped. Stable
+versions use `vMAJOR.MINOR[.PATCH]` or the same format without `v`.
+
+To build a specific revision, open **Actions → Publish Docker image → Run
+workflow** and enter a Git tag or commit hash in `ref`. The image uses the same
+tag or hash you entered. Older tags, prerelease tags and commit hashes publish
+their own image tag; only the highest stable version also updates `latest`.
+You can use a published image in Portainer instead of `build: .`.
+
+Set these repository secrets under **Settings → Secrets and variables → Actions**:
+
+| Secret | Value |
+| --- | --- |
+| `DOCKERHUB_ORG` | `agent0ai` |
+| `DOCKERHUB_OAT_TOKEN` | Docker Hub organization access token with image push access to `agent0ai/easy-service` |
+
+GitHub supplies its own read-only repository token; no GitHub token secret is needed.
 
 ## Credits
 

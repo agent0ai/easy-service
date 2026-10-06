@@ -4,46 +4,90 @@ on:
   push:
     tags:
       - "**"
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Version tag or commit hash to publish"
+        required: true
+        type: string
 
 permissions:
   contents: read
+
+concurrency:
+  group: docker-publish-${{ github.repository }}
+  cancel-in-progress: false
+  queue: max
+
+env:
+  IMAGE_REPO: agent0ai/easy-service
 
 jobs:
   publish:
     runs-on: ubuntu-latest
     steps:
-      - name: Validate Docker tag
-        env:
-          IMAGE_TAG: ${{ github.ref_name }}
-        shell: bash
-        run: |
-          if [[ ! "$IMAGE_TAG" =~ ^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$ ]]; then
-            echo "Git tag is not a valid Docker tag; use 1-128 ASCII letters, digits, dots, underscores, or dashes, starting with a letter, digit, or underscore." >&2
-            exit 1
-          fi
-
-      - name: Check out tagged revision
+      - name: Check out publication automation
         uses: actions/checkout@v6
         with:
-          ref: ${{ github.ref }}
+          ref: ${{ github.event.repository.default_branch }}
+          fetch-depth: 0
+          path: automation
+
+      - name: Select revision and image tag
+        id: plan
+        working-directory: automation
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          TARGET_REF: ${{ inputs.ref || github.ref_name }}
+        run: python3 .github/docker_release.py plan
+
+      - name: Check out selected revision
+        if: steps.plan.outputs.build == 'true'
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ steps.plan.outputs.sha }}
+          persist-credentials: false
+          path: source
 
       - name: Log in to Docker Hub
+        if: steps.plan.outputs.build == 'true'
         uses: docker/login-action@v4
         with:
           username: ${{ secrets.DOCKERHUB_ORG }}
           password: ${{ secrets.DOCKERHUB_OAT_TOKEN }}
 
       - name: Set up QEMU
+        if: steps.plan.outputs.build == 'true'
         uses: docker/setup-qemu-action@v4
 
       - name: Set up Docker Buildx
+        if: steps.plan.outputs.build == 'true'
         uses: docker/setup-buildx-action@v4
 
       - name: Build and publish tagged image
+        if: steps.plan.outputs.build == 'true'
+        id: build
         uses: docker/build-push-action@v7
         with:
-          context: .
-          file: ./Dockerfile
+          context: ./source
+          file: ./source/Dockerfile
           platforms: linux/amd64,linux/arm64
           push: true
-          tags: agent0ai/easy-service:${{ github.ref_name }}
+          tags: ${{ env.IMAGE_REPO }}:${{ steps.plan.outputs.tag }}
+
+      - name: Check whether this version is still the highest
+        if: steps.plan.outputs.build == 'true'
+        id: latest
+        working-directory: automation
+        env:
+          TARGET_REF: ${{ steps.plan.outputs.tag }}
+          BUILT_SHA: ${{ steps.plan.outputs.sha }}
+        run: |
+          git fetch --force --prune origin '+refs/tags/*:refs/tags/*'
+          python3 .github/docker_release.py latest
+
+      - name: Publish latest
+        if: steps.latest.outputs.latest == 'true'
+        env:
+          IMAGE_DIGEST: ${{ steps.build.outputs.digest }}
+        run: docker buildx imagetools create --tag "$IMAGE_REPO:latest" "$IMAGE_REPO@$IMAGE_DIGEST"
