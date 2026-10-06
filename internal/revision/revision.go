@@ -2,6 +2,7 @@ package revision
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
@@ -16,6 +17,7 @@ import (
 	"time"
 
 	"github.com/example/easy-service/internal/process"
+	"github.com/example/easy-service/internal/state"
 )
 
 type Selection struct{ SHA string }
@@ -35,7 +37,8 @@ type Manager struct {
 }
 
 func New(raw, token, data string) *Manager {
-	m := &Manager{URL: raw, Token: token, Mirror: filepath.Join(data, "git-mirror"), Client: &http.Client{Timeout: 30 * time.Second, CheckRedirect: func(req *http.Request, via []*http.Request) error {
+	identity := sha256.Sum256([]byte(raw))
+	m := &Manager{URL: raw, Token: token, Mirror: filepath.Join(data, "git-mirrors", hex.EncodeToString(identity[:12])), Client: &http.Client{Timeout: 30 * time.Second, CheckRedirect: func(req *http.Request, via []*http.Request) error {
 		if len(via) >= 10 || req.URL.Scheme != "https" || req.URL.Host != "api.github.com" {
 			return fmt.Errorf("refusing unsafe GitHub API redirect")
 		}
@@ -50,6 +53,34 @@ func (m *Manager) gitEnv(cmd *exec.Cmd) {
 		a := base64.StdEncoding.EncodeToString([]byte("x-access-token:" + m.Token))
 		cmd.Env = append(cmd.Env, "GIT_CONFIG_COUNT=1", "GIT_CONFIG_KEY_0=http.extraHeader", "GIT_CONFIG_VALUE_0=Authorization: Basic "+a)
 	}
+}
+
+// Prune retires other repositories only after a successful deployment, while
+// the controller owns selection and no old-source polling worker can use them.
+func (m *Manager) Prune() error {
+	root := filepath.Dir(m.Mirror)
+	if filepath.Base(root) != "git-mirrors" || !state.Within(root, m.Mirror) {
+		return fmt.Errorf("unsafe Git cache cleanup path")
+	}
+	entries, err := os.ReadDir(root)
+	if os.IsNotExist(err) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	for _, entry := range entries {
+		if entry.Name() == filepath.Base(m.Mirror) || !entry.IsDir() || len(entry.Name()) != 24 {
+			continue
+		}
+		if _, err := hex.DecodeString(entry.Name()); err != nil {
+			continue
+		}
+		if err := os.RemoveAll(filepath.Join(root, entry.Name())); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 func (m *Manager) run(ctx context.Context, dir string, args ...string) (string, error) {
 	c := process.Command(ctx, "git", args...)

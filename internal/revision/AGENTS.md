@@ -9,6 +9,7 @@ Select exact Git revisions and produce detached application checkouts.
 
 ## Local Contracts
 
+- Cache mirrors by source URL identity under DATA_DIR/git-mirrors so candidate repositories cannot overwrite the accepted source. Prune other owned mirror directories only after selection/return to the accepted deployment, with old-source polling stopped.
 - Return only the selected lowercase, 40-character hexadecimal commit SHA; remove checkout Git metadata. Tag/release names and timestamps remain local selection inputs, not downstream deployment fields.
 - Local working and bare repositories support commit/tag modes; only committed content is deployed.
 - For local sources mounted across UIDs, pass exact repository and `.git` trust to Git's local `upload-pack` through its native fetch option. Git clears inherited command configuration before spawning that helper. Do not use wildcard/global trust or forward GitHub authentication to local helpers.

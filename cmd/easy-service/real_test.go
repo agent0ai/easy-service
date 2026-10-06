@@ -3,17 +3,22 @@ package main
 import (
 	"context"
 	"flag"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strings"
+	"syscall"
 	"testing"
 	"time"
 
 	"github.com/example/easy-service/internal/config"
 	"github.com/example/easy-service/internal/health"
 	imagepkg "github.com/example/easy-service/internal/image"
+	"github.com/example/easy-service/internal/logs"
 	"github.com/example/easy-service/internal/process"
 	"github.com/example/easy-service/internal/proxy"
 	"github.com/example/easy-service/internal/revision"
@@ -23,6 +28,233 @@ import (
 )
 
 var realGVisor = flag.Bool("real-gvisor", false, "test the real rootless gVisor/OCI/Git/HTTP lifecycle as an unprivileged user")
+
+func TestRealConfigurationCLIAndRestart(t *testing.T) {
+	if !*realGVisor {
+		t.Skip("enable on a supported host with -real-gvisor")
+	}
+	binary := os.Getenv("EASY_SERVICE_REAL_BINARY")
+	if binary == "" {
+		t.Skip("set EASY_SERVICE_REAL_BINARY to the built supervisor (able to bind port 80)")
+	}
+	if os.Geteuid() == 0 {
+		t.Fatal("run as an unprivileged user")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+	defer cancel()
+	root := t.TempDir()
+	data, cfgDir, logDir := filepath.Join(root, "data"), filepath.Join(root, "config"), filepath.Join(root, "logs")
+	env := []string{"PATH=" + os.Getenv("PATH"), "DATA_DIR=" + data, "CONFIG_DIR=" + cfgDir, "LOG_DIR=" + logDir, "SUPERVISOR_ONLY_TEST=must-stay-outside"}
+	consolePath := filepath.Join(root, "console")
+	console, err := os.OpenFile(consolePath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer console.Close()
+	var child *exec.Cmd
+	var exited chan error
+	start := func() {
+		t.Helper()
+		child = exec.Command(binary)
+		child.Env = env
+		child.Stdout, child.Stderr = console, console
+		child.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+		if err := child.Start(); err != nil {
+			t.Fatal(err)
+		}
+		exited = make(chan error, 1)
+		go func(cmd *exec.Cmd, done chan error) { done <- cmd.Wait() }(child, exited)
+	}
+	stop := func() {
+		t.Helper()
+		if child == nil {
+			return
+		}
+		_ = child.Process.Signal(syscall.SIGTERM)
+		select {
+		case err := <-exited:
+			if err != nil {
+				b, _ := os.ReadFile(consolePath)
+				t.Fatalf("supervisor shutdown: %v\n%s", err, b)
+			}
+		case <-time.After(15 * time.Second):
+			_ = syscall.Kill(-child.Process.Pid, syscall.SIGKILL)
+			t.Fatal("supervisor shutdown stalled")
+		}
+		child = nil
+	}
+	defer func() {
+		if child != nil {
+			_ = syscall.Kill(-child.Process.Pid, syscall.SIGKILL)
+			<-exited
+		}
+	}()
+	cli := func(args ...string) string {
+		t.Helper()
+		cmd := exec.CommandContext(ctx, binary, args...)
+		cmd.Env = env
+		b, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("CLI %v: %v %s", args, err, b)
+		}
+		return string(b)
+	}
+	wait := func(ready func() bool) {
+		t.Helper()
+		deadline := time.Now().Add(45 * time.Second)
+		for !ready() {
+			if ctx.Err() != nil || time.Now().After(deadline) {
+				b, _ := os.ReadFile(consolePath)
+				t.Fatalf("real supervisor timed out\n%s", b)
+			}
+			time.Sleep(20 * time.Millisecond)
+		}
+	}
+	client := &http.Client{Timeout: time.Second}
+	served := func(want string) bool {
+		res, err := client.Get("http://127.0.0.1:80/")
+		if err != nil {
+			return false
+		}
+		defer res.Body.Close()
+		b, err := io.ReadAll(res.Body)
+		return err == nil && res.StatusCode == 200 && string(b) == want
+	}
+	start()
+	wait(func() bool { _, err := os.Stat(supervisor.ControlPath(data)); return err == nil })
+	if !strings.Contains(cli("status"), "State: waiting") {
+		t.Fatal("empty container did not wait for CLI configuration")
+	}
+	origin := t.TempDir()
+	git := revision.New(origin, "", data)
+	for _, args := range [][]string{{"init", "-b", "main"}, {"-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "--allow-empty", "-m", "fixture"}} {
+		if _, err := git.Run(ctx, origin, args...); err != nil {
+			t.Fatal(err)
+		}
+	}
+	sha, err := git.Run(ctx, origin, "rev-parse", "HEAD")
+	if err != nil {
+		t.Fatal(err)
+	}
+	run := `test -z "${SUPERVISOR_ONLY_TEST+x}" && echo "stdout $MESSAGE" && echo "stderr $MESSAGE" >&2 && exec /bin/busybox httpd -f -p "$PORT" -h /app`
+	setup := `printf '%s' "$MESSAGE" > index.html && mkdir -p cgi-bin && printf '%s\n' '#!/bin/sh' 'printf "Content-Type: text/event-stream\r\n\r\n"' 'while :; do printf "data: tick\n\n"; sleep 1; done' > cgi-bin/stream && chmod +x cgi-bin/stream`
+	cli("config", "set", "GIT_URL="+origin, "RUN_COMMAND="+run, "SETUP_COMMAND="+setup, "RUNTIME_IMAGE=busybox@sha256:5cec3fc171c87218698e85a52af7087de727372aae264a787b8112901a5b0092", "APP_MESSAGE=one", "POLL_INTERVAL=3600", "HEALTH_INTERVAL=0.2", "DRAIN_TIMEOUT=20")
+	if served("one") {
+		t.Fatal("set launched an application")
+	}
+	cli("config", "apply")
+	wait(func() bool { return served("one") })
+	oldFiles, err := os.ReadDir(logDir)
+	if err != nil || len(oldFiles) == 0 {
+		t.Fatalf("no app output captured: %v", err)
+	}
+	joined := ""
+	for _, f := range oldFiles {
+		b, _ := os.ReadFile(filepath.Join(logDir, f.Name()))
+		joined += string(b)
+	}
+	if !strings.Contains(joined, "stdout one") || !strings.Contains(joined, "stderr one") || !strings.Contains(joined, "commit: \""+sha+"\"") || !strings.HasPrefix(joined, "---\n") {
+		t.Fatalf("missing output/frontmatter: %s", joined)
+	}
+	cli("config", "set", "APP_MESSAGE=two")
+	if !served("one") {
+		t.Fatal("pending setting interrupted service")
+	}
+	stop()
+	start()
+	wait(func() bool { return served("one") })
+	if cli("config", "show", "APP_MESSAGE") != "APP_MESSAGE=two\n" {
+		t.Fatal("restart lost pending settings")
+	}
+	for _, f := range oldFiles {
+		if _, err := os.Stat(filepath.Join(logDir, f.Name())); err != nil {
+			t.Fatal("retired instance logs disappeared:", err)
+		}
+	}
+	streamRequest, _ := http.NewRequestWithContext(ctx, "GET", "http://127.0.0.1:80/cgi-bin/stream", nil)
+	stream, err := (&http.Client{}).Do(streamRequest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stream.Body.Close()
+	if _, err := io.ReadFull(stream.Body, make([]byte, len("data: tick\n\n"))); err != nil {
+		t.Fatal(err)
+	}
+	applied := make(chan error, 1)
+	go func() {
+		cmd := exec.CommandContext(ctx, binary, "config", "apply")
+		cmd.Env = env
+		b, err := cmd.CombinedOutput()
+		if err != nil {
+			err = fmt.Errorf("%v %s", err, b)
+		}
+		applied <- err
+	}()
+	wait(func() bool { return served("two") })
+	if killed := cli("kill-draining"); killed != "Killed 1 draining instances\n" {
+		t.Fatalf("urgent real kill: %q", killed)
+	}
+	select {
+	case err := <-applied:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("urgent kill did not unblock real drain")
+	}
+	stream.Body.Close()
+	if killed := cli("kill-draining"); killed != "Killed 0 draining instances\n" || !served("two") {
+		t.Fatal("empty force-stop touched the current app")
+	}
+	cli("config", "set", "RUN_COMMAND=false")
+	bad := exec.CommandContext(ctx, binary, "config", "apply")
+	bad.Env = env
+	if b, err := bad.CombinedOutput(); err == nil {
+		t.Fatalf("bad command accepted: %s", b)
+	}
+	if !served("two") {
+		t.Fatal("failed real candidate interrupted serving")
+	}
+	cli("config", "set", "RUN_COMMAND="+run)
+	cli("config", "apply")
+	before := cli("status")
+	cli("config", "set", "LOG_RETENTION_DAYS=1", "LOG_MAX_FILE_SIZE=1K", "LOG_MAX_TOTAL_SIZE=1K")
+	cli("config", "apply")
+	after := cli("status")
+	instance := func(status string) string {
+		for _, line := range strings.Split(status, "\n") {
+			if strings.HasPrefix(line, "Instance: ") {
+				return line
+			}
+		}
+		return ""
+	}
+	if instance(before) == "" || instance(before) != instance(after) || !served("two") {
+		t.Fatal("log policy replaced the real app instance")
+	}
+	files, _ := os.ReadDir(logDir)
+	var total int64
+	for _, f := range files {
+		info, err := f.Info()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if info.Size() > 1024 {
+			t.Fatal("live file limit exceeded")
+		}
+		total += info.Size()
+	}
+	if total > 1024 {
+		t.Fatalf("live total log cap exceeded: %d", total)
+	}
+	stop()
+	b, _ := os.ReadFile(consolePath)
+	for _, event := range []string{"configuration staged", "configuration applied", "candidate healthy", "draining previous", "instance exited", "log collector removed"} {
+		if !strings.Contains(string(b), event) {
+			t.Fatal(fmt.Sprintf("missing console lifecycle event %q", event))
+		}
+	}
+}
 
 func TestRealGVisorLifecycle(t *testing.T) {
 	if !*realGVisor {
@@ -66,9 +298,14 @@ func TestRealGVisorLifecycle(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	capture, err := logs.New(t.TempDir(), logs.Policy{Days: 30, FileSize: 10 << 20, TotalSize: 1 << 30})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer capture.Close()
 	t.Setenv("SUPERVISOR_ONLY_TEST", "must-stay-outside")
-	cfg := config.Config{DataDir: data, GitURL: origin, RuntimeImage: ref, SetupCommand: `/bin/busybox nslookup example.com >/dev/null && mkdir -p "$HOME" && printf prepared > "$HOME/setup-marker" && /bin/busybox dd if=/dev/zero of=/tmp/setup-data bs=1M count=70`, RunCommand: `test "$EXPECTED" = workload-visible && test -z "${SUPERVISOR_ONLY_TEST+x}" && test ! -e .git && test -f "$HOME/setup-marker" && test "$(wc -c </tmp/setup-data)" -eq 73400320 && test "$(cat index.html)" != bad && exec /bin/busybox httpd -f -p "$PORT" -h /app`, AppEnv: []string{"EXPECTED=workload-visible"}, StartupTimeout: 30 * time.Second, HealthInterval: time.Second, HealthFailures: 3}
-	e := &supervisor.Engine{Cfg: cfg, Runtime: runtimeAdapter{sandbox.Runtime{Data: data, ImageEnv: image.Env, Stdout: os.Stdout, Stderr: os.Stderr}}, Checkout: git, Proxy: proxy.New(), Store: state.Store{Data: data}, Health: health.New(cfg.HealthInterval, "/index.html"), Rootfs: image.Rootfs, Digest: image.Digest, Drain: time.Second, RuntimeContext: ctx, Failures: make(chan uint64, 1)}
+	cfg := config.Config{DataDir: data, GitURL: origin, RuntimeImage: ref, SetupCommand: `/bin/busybox nslookup example.com >/dev/null && mkdir -p "$HOME" && printf prepared > "$HOME/setup-marker" && /bin/busybox dd if=/dev/zero of=/tmp/setup-data bs=1M count=70`, RunCommand: `echo app-stdout; echo app-stderr >&2; test "$EXPECTED" = workload-visible && test -z "${SUPERVISOR_ONLY_TEST+x}" && test ! -e .git && test -f "$HOME/setup-marker" && test "$(wc -c </tmp/setup-data)" -eq 73400320 && test "$(cat index.html)" != bad && exec /bin/busybox httpd -f -p "$PORT" -h /app`, AppEnv: []string{"EXPECTED=workload-visible"}, StartupTimeout: 30 * time.Second, HealthInterval: time.Second, HealthFailures: 3}
+	e := &supervisor.Engine{Cfg: cfg, Runtime: runtimeAdapter{sandbox.Runtime{Data: data, ImageEnv: image.Env, Logs: capture, Stdout: os.Stdout, Stderr: os.Stderr}}, Checkout: git, Proxy: proxy.New(), Store: state.Store{Data: data}, Health: health.New(cfg.HealthInterval, "/index.html"), Rootfs: image.Rootfs, Digest: image.Digest, Logs: capture, Drain: time.Second, RuntimeContext: ctx, Failures: make(chan uint64, 1)}
 	t.Cleanup(func() { e.Shutdown(context.Background()) })
 	front := httptest.NewServer(e.Proxy)
 	defer front.Close()

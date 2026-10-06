@@ -61,6 +61,7 @@ func (i *httpInstance) Stop(context.Context) error {
 	})
 	return nil
 }
+func (i *httpInstance) Kill(ctx context.Context) error { return i.Stop(ctx) }
 func (r *httpRuntime) Start(op, lifetime context.Context, id, prepared, _ string, _ []string) (Instance, error) {
 	bundle := filepath.Join(r.Data, "instances", id)
 	if err := sandbox.CopyTree(op, filepath.Join(prepared, "rootfs"), filepath.Join(bundle, "rootfs")); err != nil {

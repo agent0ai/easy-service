@@ -3,6 +3,7 @@ package supervisor
 import (
 	"context"
 	"errors"
+	"fmt"
 	"github.com/example/easy-service/internal/config"
 	"github.com/example/easy-service/internal/health"
 	"github.com/example/easy-service/internal/proxy"
@@ -13,6 +14,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -28,8 +30,9 @@ type fi struct {
 	stopOnce sync.Once
 }
 
-func (i *fi) Exited() bool       { return i.ex.Load() }
-func (i *fi) Done() <-chan error { return i.done }
+func (i *fi) Exited() bool                   { return i.ex.Load() }
+func (i *fi) Done() <-chan error             { return i.done }
+func (i *fi) Kill(ctx context.Context) error { return i.Stop(ctx) }
 func (i *fi) Stop(context.Context) error {
 	i.stopOnce.Do(func() {
 		i.ex.Store(true)
@@ -74,6 +77,43 @@ func TestFailedStopPreservesFilesystemAndRestartAllowance(t *testing.T) {
 	if r.restarts != 0 || r.starts != 0 || e.active.Restarted {
 		t.Fatal("failed stop consumed a restart or launched a process")
 	}
+}
+
+func TestKillAllRetiredInstancesKeepsActiveAndCleansFailedStops(t *testing.T) {
+	e, _ := engineFor(t, fakeHealth{})
+	active := &fi{done: make(chan error)}
+	e.active = &Active{Instance: active}
+	var retired []*unstoppableInstance
+	for n := range 2 {
+		id := fmt.Sprintf("retired%d", n)
+		i := &unstoppableInstance{fi: &fi{done: make(chan error)}, bundle: filepath.Join(e.Cfg.DataDir, "instances", id), root: filepath.Join(e.Cfg.DataDir, "runsc-root", id)}
+		for _, path := range []string{i.bundle, i.root} {
+			if err := os.MkdirAll(path, 0700); err != nil {
+				t.Fatal(err)
+			}
+		}
+		ctx, cancel := context.WithCancel(context.Background())
+		if e.draining == nil {
+			e.draining = map[uint64]*retirement{}
+		}
+		e.draining[uint64(n+1)] = &retirement{i, ctx, cancel}
+		retired = append(retired, i)
+	}
+	killed, err := e.KillDraining(context.Background())
+	if err != nil || killed != 2 || active.Exited() || len(e.draining) != 0 {
+		t.Fatalf("kill all retired: %d %v", killed, err)
+	}
+	for _, i := range retired {
+		if !i.Exited() {
+			t.Fatal("retired instance still alive")
+		}
+		for _, path := range []string{i.bundle, i.root} {
+			if _, err := os.Stat(path); !os.IsNotExist(err) {
+				t.Fatal("force-stop retained retired filesystem")
+			}
+		}
+	}
+	e.active = nil
 }
 
 type fr struct {
@@ -940,7 +980,7 @@ func TestShutdownPreservesDurableStateForRestartRecovery(t *testing.T) {
 	if err != nil {
 		t.Fatalf("shutdown removed cached recovery state: %v", err)
 	}
-	if got != want {
+	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("shutdown changed cached recovery state: got %+v", got)
 	}
 }

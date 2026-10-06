@@ -12,16 +12,26 @@ import (
 	"time"
 )
 
-type State struct{ Revision, Digest, GitURL, ImageRef string }
+type State struct {
+	Revision, Digest, GitURL, ImageRef string
+	Overrides                          map[string]string `json:"overrides,omitempty"`
+}
 
 func (v State) Recoverable(gitURL, imageRef string) bool {
 	return v.GitURL != "" && v.GitURL == gitURL && v.ImageRef == imageRef && v.Revision != ""
 }
 
-type Store struct{ Data string }
+type Store struct{ Data, ConfigDir string }
+
+func (s Store) directory() string {
+	if s.ConfigDir != "" {
+		return s.ConfigDir
+	}
+	return filepath.Join(s.Data, "state")
+}
 
 func (s Store) Save(v State) error {
-	d := filepath.Join(s.Data, "state")
+	d := s.directory()
 	if e := os.MkdirAll(d, 0700); e != nil {
 		return e
 	}
@@ -35,12 +45,12 @@ func (s Store) Save(v State) error {
 
 // AtomicWrite makes the file contents durable before publishing the rename.
 func AtomicWrite(dst string, b []byte) (err error) {
-	tmp := dst + ".tmp"
-	defer os.Remove(tmp)
-	f, err := os.OpenFile(tmp, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0600)
+	f, err := os.CreateTemp(filepath.Dir(dst), filepath.Base(dst)+".tmp-")
 	if err != nil {
 		return err
 	}
+	tmp := f.Name()
+	defer os.Remove(tmp)
 	_, err = f.Write(b)
 	if err == nil {
 		err = f.Sync()
@@ -67,7 +77,7 @@ func syncDir(path string) error {
 }
 func (s Store) Load() (State, error) {
 	var v State
-	b, e := os.ReadFile(filepath.Join(s.Data, "state", "active.json"))
+	b, e := os.ReadFile(filepath.Join(s.directory(), "active.json"))
 	if e != nil {
 		return v, e
 	}
@@ -75,14 +85,14 @@ func (s Store) Load() (State, error) {
 	return v, e
 }
 func (s Store) Clear() error {
-	e := os.Remove(filepath.Join(s.Data, "state", "active.json"))
+	e := os.Remove(filepath.Join(s.directory(), "active.json"))
 	if errors.Is(e, os.ErrNotExist) {
 		return nil
 	}
 	if e != nil {
 		return e
 	}
-	return syncDir(filepath.Join(s.Data, "state"))
+	return syncDir(s.directory())
 }
 func (s Store) Reconcile() error {
 	_, e := s.Load()
@@ -147,6 +157,34 @@ func (s Store) Reconcile() error {
 		if e = os.RemoveAll(path); e != nil {
 			return e
 		}
+	}
+	// Applied configuration and its last healthy revision survive reconciliation.
+	if s.ConfigDir != "" {
+		entries, err := os.ReadDir(s.ConfigDir)
+		if os.IsNotExist(err) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		for _, entry := range entries {
+			if !entry.Type().IsRegular() {
+				continue
+			}
+			for _, name := range []string{"active.json", "pending.json"} {
+				prefix := name + ".tmp-"
+				if !strings.HasPrefix(entry.Name(), prefix) {
+					continue
+				}
+				if _, err := strconv.ParseUint(strings.TrimPrefix(entry.Name(), prefix), 10, 32); err != nil {
+					continue
+				}
+				if err := os.Remove(filepath.Join(s.ConfigDir, entry.Name())); err != nil {
+					return err
+				}
+			}
+		}
+		return nil
 	}
 	return s.Clear()
 }

@@ -6,7 +6,8 @@ Own the implementation contracts for revision selection, installation, isolation
 
 - This file owns package boundaries and verification across the deployment flow.
 - Each child owns its implementation and regression tests; the command owns process wiring.
-- Flow: config → revision/image → preparation → sandbox launch → health → proxy cutover → drain → recovery/state.
+- Flow: configuration defaults/overrides → revision/image → preparation → sandbox launch/output capture → health → atomic config/state publication → proxy cutover → drain → recovery.
+- Pending settings and retained logs remain independent of sandbox and cache cleanup.
 
 ## Local Contracts
 
@@ -26,12 +27,13 @@ Own the implementation contracts for revision selection, installation, isolation
 
 ## Child DOX Index
 
-- [config/AGENTS.md](config/AGENTS.md): public environment parsing and validation.
+- [config/AGENTS.md](config/AGENTS.md): public defaults, environment validation and durable staging.
 - [revision/AGENTS.md](revision/AGENTS.md): Git/GitHub selection and exact checkouts.
+- [logs/AGENTS.md](logs/AGENTS.md): daily instance output files, rotation, retention and writer lifetime.
 - [image/AGENTS.md](image/AGENTS.md): digest resolution, OCI copy/unpack and image cache.
 - [process/AGENTS.md](process/AGENTS.md): bounded helper execution and process groups.
 - [sandbox/AGENTS.md](sandbox/AGENTS.md): rootless gVisor, filesystems and memory observation.
 - [health/AGENTS.md](health/AGENTS.md): readiness and liveness probes.
 - [proxy/AGENTS.md](proxy/AGENTS.md): HTTP transport, streaming, upgrades and request drain.
-- [state/AGENTS.md](state/AGENTS.md): durable state, shared cleanup bounds and startup reconciliation.
+- [state/AGENTS.md](state/AGENTS.md): atomic accepted configuration/state, shared cleanup bounds and startup reconciliation.
 - [supervisor/AGENTS.md](supervisor/AGENTS.md): deployment, cutover, recovery, private control/status and integration/load checks.

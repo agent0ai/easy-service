@@ -21,7 +21,7 @@ func TestReconciliationFailurePropagatesToProcessOwner(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(data, "state", "active.json"), []byte("not-json"), 0600); err != nil {
 		t.Fatal(err)
 	}
-	err := run(context.Background(), config.Config{DataDir: data}, proxy.New(), make(chan struct{}))
+	err := run(context.Background(), config.Config{DataDir: data}, proxy.New(), nil)
 	if err == nil || !strings.Contains(err.Error(), "restart reconciliation") {
 		t.Fatalf("reconciliation error did not reach process owner: %v", err)
 	}
@@ -44,7 +44,7 @@ func TestExistingControlOwnerPreventsReconciliation(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(data, "state", "active.json"), []byte("not-json"), 0600); err != nil {
 		t.Fatal(err)
 	}
-	err = run(ctx, cfg, proxy.New(), make(chan struct{}))
+	err = run(ctx, cfg, proxy.New(), nil)
 	if err == nil || !strings.Contains(err.Error(), "control socket is already in use") {
 		t.Fatalf("second supervisor reached state reconciliation: %v", err)
 	}

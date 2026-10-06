@@ -141,6 +141,18 @@ func TestControlActionsWithLocalGit(t *testing.T) {
 	if code, body := request("GET", "status"); code != 200 || !strings.Contains(body, first) {
 		t.Fatal("status blocked behind stream drain")
 	}
+	if code, body := request("POST", "kill-draining"); code != 200 || !strings.Contains(body, `"killed":1`) {
+		t.Fatalf("urgent kill blocked behind redeploy: %d %s", code, body)
+	}
+	if !old.Exited() || active().Exited() {
+		t.Fatal("urgent kill stopped the current instance or left the retired one alive")
+	}
+	if _, err := io.ReadFull(stream.Body, make([]byte, 1)); err == nil {
+		t.Fatal("retired stream survived urgent kill")
+	}
+	if code, body := request("POST", "kill-draining"); code != 200 || !strings.Contains(body, `"killed":0`) {
+		t.Fatalf("empty draining set: %d %s", code, body)
+	}
 	stream.Body.Close()
 	if err := <-redeployed; err != nil {
 		t.Fatal(err)

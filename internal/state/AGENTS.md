@@ -9,15 +9,15 @@ Own persistent active state and reconciliation after supervisor restart.
 
 ## Local Contracts
 
-- Publish state/metadata by file write, sync and close, atomic rename, then directory sync.
+- Publish state/metadata through a fresh private temporary file, write/sync/close, atomic rename, then directory sync; never follow an existing temporary-file symlink.
 - Treat persisted state as untrusted input; cleanup paths must stay under the configured data directory.
-- Keep only revision, digest, Git source URL and image reference in the active record; process IDs and filesystem paths are discovered from live runtimes instead of saved state. Ignore obsolete fields when reading older records.
+- Keep revision, digest, Git source URL, image reference and accepted overrides in one CONFIG_DIR/active.json record; process IDs and filesystem paths are discovered from live runtimes instead of saved state. Ignore obsolete fields when reading older records.
 - `Within` owns the shared lexical cleanup-boundary check used by reconciliation and the engine; exclude the root itself, sibling prefixes and paths outside the root.
 - Verify live process ownership before signaling a process group; never trust a PID from older state.
 - Discover unrecorded setup/candidate groups once at startup using same-user runsc executables and exact owned root/bundle paths.
 - Kill owned orphan groups and wait for observed members to stop before deleting their filesystems; compare process start times to avoid waiting on reused PIDs.
 - Sync the state directory after clearing the active record.
-- Reconcile stale runtime state before a new deployment.
+- Reconcile stale runtime state before a new deployment. Preserve accepted configuration and its recovery identity; collect only owned numeric active/pending temporary files from interrupted writes. Store instances, runtime roots and preparation data separately under DATA_DIR.
 - Persist the configured Git URL with revision and image identity. `State.Recoverable` permits initial recovery only for the same non-empty source URL and runtime image; older records without source identity require fresh selection.
 - Propagate malformed state and cleanup errors to the process owner.
 

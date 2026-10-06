@@ -58,7 +58,8 @@ func (m Manager) Cached(ref, digest string) (Prepared, error) {
 	return p, nil
 }
 
-// Prune runs after startup has selected its usable image, including offline recovery.
+// Prune runs only after a usable deployment is selected or a failed update
+// returns to the previously selected image, including offline recovery.
 func (m Manager) Prune(keep Prepared) error {
 	root := filepath.Join(m.Data, "images")
 	dir := filepath.Dir(filepath.Dir(keep.Rootfs))

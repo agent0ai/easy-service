@@ -4,7 +4,7 @@ Own rootless gVisor isolation, private application filesystems and sandbox proce
 
 ## Ownership
 
-- `sandbox.go` owns prerequisite checks, OCI specs, preparation, start/restart, stop, logging and process-tree RSS.
+- `sandbox.go` owns prerequisite checks, OCI specs, preparation, start/restart, stop/kill, output wiring and process-tree RSS; retained files belong to `internal/logs`.
 - Recovery decisions belong to the supervisor engine; image unpack belongs to `internal/image`.
 
 ## Local Contracts
@@ -15,9 +15,11 @@ Own rootless gVisor isolation, private application filesystems and sandbox proce
 - Mount an owned read-only copy of the outer container's resolv.conf; OCI images may omit resolver configuration.
 - Copy disk-backed private rootfs trees and disable runsc's additional root overlay so setup/runtime writes persist in that owned tree; replace image `/app` before copying checkout content so host copies cannot follow its symlink.
 - Bind /tmp to its private disk-backed rootfs directory, replacing image symlinks before host access. An explicit bind prevents runsc's automatic tmpfs over an empty /tmp; setup files survive launch and restart without a fixed temporary-storage cap. HOME also stays in the private filesystem.
-- Setup is bounded to fifteen minutes and stops before failed preparation is removed.
+- Setup uses SETUP_TIMEOUT (fifteen minutes by default) and stops before failed preparation is removed.
 - Separate filesystem-operation cancellation from running sandbox lifetime.
-- `Done` is a closed broadcast; repeated `Wait` calls preserve the exit result.
+- `Done` is a closed broadcast immediately after process/output completion, before console reporting or file-writer retirement can block. Repeated `Wait` calls preserve the exit result.
+- Capture registered instance stdout/stderr through the shared log owner, while retaining console prefixes. Release file handles without deleting retained pages or registrations for a later phase.
+- Explicit Kill sends SIGKILL only to the live instance's owned process group and waits for reaping; never signal a completed instance. The engine determines retirement ownership.
 - Do not signal completed instances. Stop escalates from TERM to KILL when its grace context expires and waits up to two additional seconds for process/output completion before reporting success.
 - Merge default PATH/HOME, immutable image environment and explicit application values in that order; reserve only the assigned PORT. HOME defaults to /root. Never inherit supervisor credentials/environment into the workload.
 - RSS is a soft observation of the active owned process tree, including children from all threads; memory replacement policy stays in the engine.

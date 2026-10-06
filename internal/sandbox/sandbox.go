@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"os"
 	"os/exec"
@@ -16,6 +17,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/example/easy-service/internal/logs"
 	"github.com/example/easy-service/internal/process"
 )
 
@@ -65,6 +67,8 @@ type Instance struct {
 type Runtime struct {
 	Data           string
 	ImageEnv       []string
+	Logs           *logs.Manager
+	SetupTimeout   time.Duration
 	Stdout, Stderr io.Writer
 }
 
@@ -114,7 +118,11 @@ func (r Runtime) Prepare(ctx context.Context, id, base, checkout, setup string, 
 		return "", e
 	}
 	if setup != "" {
-		op, cancel := context.WithTimeout(ctx, 15*time.Minute)
+		timeout := r.SetupTimeout
+		if timeout <= 0 {
+			timeout = 15 * time.Minute
+		}
+		op, cancel := context.WithTimeout(ctx, timeout)
 		defer cancel()
 		i, e := r.start(op, "setup-"+id, dir, setup, env)
 		if e != nil {
@@ -301,13 +309,27 @@ func (r Runtime) start(ctx context.Context, id, bundle, command string, env []st
 	if strings.HasPrefix(id, "setup-") {
 		phase, logID = "setup", strings.TrimPrefix(id, "setup-")
 	}
-	cmd.Stdout = &prefixWriter{r.Stdout, "[" + logID + "][" + phase + "][stdout] "}
-	cmd.Stderr = &prefixWriter{r.Stderr, "[" + logID + "][" + phase + "][stderr] "}
+	if r.Logs != nil {
+		cmd.Stdout, cmd.Stderr, logID = r.Logs.Output(id, phase, r.Stdout, r.Stderr)
+	} else {
+		cmd.Stdout = &prefixWriter{r.Stdout, "[" + logID + "][" + phase + "][stdout] "}
+		cmd.Stderr = &prefixWriter{r.Stderr, "[" + logID + "][" + phase + "][stderr] "}
+	}
 	if e := cmd.Start(); e != nil {
+		if r.Logs != nil {
+			r.Logs.Release(logID)
+		}
 		return nil, e
 	}
 	i := &Instance{ID: id, Bundle: bundle, Root: root, Port: port, cmd: cmd, done: make(chan error)}
-	go func() { i.waitErr = process.Wait(cmd); close(i.done) }()
+	go func() {
+		i.waitErr = process.Wait(cmd)
+		close(i.done)
+		if r.Logs != nil {
+			r.Logs.Release(logID)
+		}
+		log.Printf("instance exited instance=%s phase=%s error=%v", logID, phase, i.waitErr)
+	}()
 	return i, nil
 }
 func workloadEnv(image, app []string, servicePort int) []string {
@@ -373,6 +395,24 @@ func (i *Instance) Stop(ctx context.Context) error {
 		case <-t.C:
 			return fmt.Errorf("sandbox did not finish after forced stop: %w", ctx.Err())
 		}
+	}
+}
+
+// Kill is reserved for an explicit force-stop of a retired instance.
+func (i *Instance) Kill(ctx context.Context) error {
+	if i.Exited() {
+		return nil
+	}
+	if i.cmd.Process != nil {
+		if err := syscall.Kill(-i.cmd.Process.Pid, syscall.SIGKILL); err != nil && err != syscall.ESRCH {
+			return err
+		}
+	}
+	select {
+	case <-i.done:
+		return nil
+	case <-ctx.Done():
+		return fmt.Errorf("sandbox did not finish after kill: %w", ctx.Err())
 	}
 }
 

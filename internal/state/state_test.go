@@ -6,6 +6,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"reflect"
 	"syscall"
 	"testing"
 	"time"
@@ -13,13 +14,13 @@ import (
 
 func TestAtomicStateRecoveryAndCleanup(t *testing.T) {
 	d := t.TempDir()
-	s := Store{d}
+	s := Store{Data: d}
 	v := State{Revision: "abc", GitURL: "/source/one", ImageRef: "image"}
 	if e := s.Save(v); e != nil {
 		t.Fatal(e)
 	}
 	got, e := s.Load()
-	if e != nil || got != v {
+	if e != nil || !reflect.DeepEqual(got, v) {
 		t.Fatalf("%+v %v", got, e)
 	}
 	if !got.Recoverable(v.GitURL, v.ImageRef) || got.Recoverable("/source/two", v.ImageRef) || got.Recoverable(v.GitURL, "changed-image") {
@@ -106,7 +107,7 @@ func TestReconcileStopsUnrecordedAndUncooperativeRuntime(t *testing.T) {
 		t.Run(area, func(t *testing.T) {
 			data := t.TempDir()
 			_, done := reconcileProcess(t, data, "runsc", area, true)
-			if err := (Store{data}).Reconcile(); err != nil {
+			if err := (Store{Data: data}).Reconcile(); err != nil {
 				t.Fatal(err)
 			}
 			select {
@@ -127,7 +128,7 @@ func TestReconcileDoesNotSignalUnrelatedPID(t *testing.T) {
 				actualData = t.TempDir()
 			}
 			cmd, done := reconcileProcess(t, actualData, name, "instances", false)
-			s := Store{data}
+			s := Store{Data: data}
 			if err := s.Save(State{}); err != nil {
 				t.Fatal(err)
 			}
@@ -160,6 +161,47 @@ func TestWithinExcludesRootPeersAndTraversal(t *testing.T) {
 	} {
 		if got := Within(root, path); got != want {
 			t.Errorf("Within(%q, %q) = %t, want %t", root, path, got, want)
+		}
+	}
+}
+
+func TestAtomicWriteUsesPrivateTempAndReconcileRetainsConfig(t *testing.T) {
+	dir := t.TempDir()
+	dst := filepath.Join(dir, "active.json")
+	outside := filepath.Join(t.TempDir(), "outside")
+	if err := os.WriteFile(outside, []byte("untouched"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, dst+".tmp"); err != nil {
+		t.Fatal(err)
+	}
+	if err := AtomicWrite(dst, []byte(`{"overrides":{"APP_KEY":"fixture"}}`)); err != nil {
+		t.Fatal(err)
+	}
+	b, err := os.ReadFile(outside)
+	if err != nil || string(b) != "untouched" {
+		t.Fatal("atomic write followed a preexisting temp symlink")
+	}
+	info, err := os.Stat(dst)
+	if err != nil || info.Mode().Perm() != 0600 {
+		t.Fatal("published credentials were not private")
+	}
+	for _, name := range []string{"active.json.tmp-1234", "pending.json.tmp-5678", "pending.json.tmp-not-ours"} {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte("partial"), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := (Store{Data: t.TempDir(), ConfigDir: dir}).Reconcile(); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"active.json.tmp-1234", "pending.json.tmp-5678"} {
+		if _, err := os.Stat(filepath.Join(dir, name)); !os.IsNotExist(err) {
+			t.Fatal("crashed atomic write was not collected")
+		}
+	}
+	for _, path := range []string{dst, dst + ".tmp", filepath.Join(dir, "pending.json.tmp-not-ours"), outside} {
+		if _, err := os.Lstat(path); err != nil {
+			t.Fatal("reconciliation removed configuration/unowned data:", err)
 		}
 	}
 }

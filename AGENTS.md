@@ -81,13 +81,15 @@ Default section order:
 - Support local Git directories for quick integration tests and normal HTTP streaming, SSE and WebSocket traffic.
 - Fix the shared owner of a defect and verify its regression plus the affected end-to-end path; do not hide shared defects with caller coercions, retries, fallbacks or duplicated logic.
 - Keep this DOX hierarchy current with meaningful changes.
+- Runtime configuration uses staged `config set`/`unset`, full or filtered `config show`, and explicit `config apply`; Docker environment values are defaults beneath durable overrides.
+- Retain instance stdout/stderr independently of sandbox cleanup, in daily paginated logs with configurable age, file and total size limits. Keep config, logs and caches in separate folders without mandatory volume mappings.
 - Keep README.md simple: lead with the five basic launch settings, show the container CLI, then list optional settings.
 - Launch gVisor directly as 8020 does, sharing the outer container's network with an automatically assigned PORT per instance; do not add RootlessKit/slirp4netns, TUN access or subordinate UID/GID setup.
 
 ## Child DOX Index
 
 - [cmd/AGENTS.md](cmd/AGENTS.md): executable wiring, container CLI, runtime adapter and process shutdown.
-- [internal/AGENTS.md](internal/AGENTS.md): package boundaries, deployment flow and nine package-specific child contracts.
+- [internal/AGENTS.md](internal/AGENTS.md): package boundaries, deployment flow and ten package-specific child contracts.
 - [scripts/AGENTS.md](scripts/AGENTS.md): repository contract checks.
 - [.github/AGENTS.md](.github/AGENTS.md): tagged multi-platform Docker publication.
 
@@ -100,10 +102,13 @@ The root owns README.md, Dockerfile, compose.yaml, Makefile, go.mod, .gitignore 
 - Run `make check` with Go 1.23 or later: formatting, vet, race tests and `scripts/contract-test.sh`.
 - Cross-package tests may fake owned external boundaries; real OCI/gVisor and Docker build checks require their documented tools and host prerequisites.
 - Docker runtime packaging retains runsc and its companion helpers while excluding the unused containerd shim; this service launches runsc directly.
-- The same Docker binary starts the supervisor without arguments and provides `status`, `redeploy`, `restart` and `help` subcommands. Control stays on a private Unix socket under DATA_DIR.
+- The same Docker binary starts the supervisor without arguments and provides `status`, `redeploy`, `restart`, `kill-draining`, `config` and `help` subcommands. Control stays on a private Unix socket under DATA_DIR.
 - Runtime images default to `debian:bookworm-slim`; use Skopeo's native Docker image-name handling for shorthand names.
 - Preserve image environment defaults and explicit APP_* overrides, reserving only PORT; HOME defaults to /root. Setup writes in HOME and /tmp stay on the private writable filesystem.
-- After image selection at startup, discard source archives and stale image caches while retaining the selected filesystem and OCI environment configuration for offline recovery.
+- Accepted configuration and revision/image identity share one atomic record in CONFIG_DIR; pending changes never activate on restart. An unconfigured container keeps its control CLI available.
+- Apply through immutable candidate settings and the existing readiness/cutover/drain engine. Supervisor policy changes avoid app replacement. Urgent kill-draining bypasses a blocked drain and may force-stop only registered retired instances.
+- Logs live in LOG_DIR and survive instance cleanup, defaulting to thirty days, 10 MiB pages and 1 GiB combined. Short random instance IDs remain unique against live runtimes and retained logs.
+- Discard source archives and stale image/Git caches only after usable selection or return to the previously accepted deployment; preserve offline recovery inputs.
 - Compose grants ninety seconds for outer-container shutdown so the supervisor can finish request drain and sandbox cleanup.
 - Tagged Docker publication requires GitHub Actions secrets `DOCKERHUB_ORG` and `DOCKERHUB_OAT_TOKEN`; Git tags are preserved exactly and no `latest` tag is published.
 - Follow the nearest child verification instructions for local edits. Documentation-only changes require link/index and source-contract review.

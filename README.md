@@ -20,10 +20,7 @@ services:
       RUNTIME_IMAGE: node:22-bookworm-slim
       SETUP_COMMAND: npm ci
       RUN_COMMAND: node server.js
-    volumes: [easy-service-data:/data]
     security_opt: [seccomp=unconfined]
-volumes:
-  easy-service-data:
 ```
 
 For a private repository, set `GIT_TOKEN` in your shell or Portainer environment.
@@ -47,7 +44,7 @@ application settings as `APP_NAME=value`; the application receives `NAME=value`.
 Image environment defaults are preserved; `APP_*` overrides them, including
 `PATH` and `HOME`. `PORT` is always assigned by the supervisor. If the image has
 no `HOME`, it defaults to `/root`. Git credentials stay in the supervisor.
-Setup has a 15-minute timeout. Files installed under `$HOME` or `/tmp` survive
+Setup has a 15-minute timeout by default. Files installed under `$HOME` or `/tmp` survive
 into the running instance; both use its private writable filesystem.
 
 ## Inspect and control
@@ -56,6 +53,7 @@ into the running instance; both use its private writable filesystem.
 docker compose exec easy-service easy-service status
 docker compose exec easy-service easy-service redeploy
 docker compose exec easy-service easy-service restart
+docker compose exec easy-service easy-service kill-draining
 docker compose logs -f easy-service
 ```
 
@@ -64,11 +62,52 @@ docker compose logs -f easy-service
   even if the revision has not changed. It reuses the prepared dependencies.
 - `restart` restarts the current revision with its existing writable files.
   This briefly interrupts service.
+- `kill-draining` immediately force-stops all retired instances, even while
+  `apply` or `redeploy` waits for them to drain. It leaves the current instance
+  running. Retired logs remain subject to the normal retention rules.
 
 Inside the container, use `easy-service status`, `easy-service redeploy`, or
 `easy-service restart` directly. Actions wait for completion and report failures.
 During startup, status shows `waiting`. The CLI uses a private Unix socket;
 there is no extra network port to expose.
+
+## Change settings
+
+In the container's console:
+
+```sh
+easy-service config show
+easy-service config show APP_A0_API_URL APP_VENICE_API_KEY
+easy-service config set APP_A0_API_URL=https://api.example.com APP_VENICE_API_KEY=new-key
+easy-service config set SERVICE_MEMORY_LIMIT=768M HEALTH_FAILURES=5
+easy-service config apply
+```
+
+`show` prints all settings, including their values, or only the names you list.
+It shows pending settings. `set` requires `NAME=value` arguments and
+saves the whole batch without changing the running service. Set several batches,
+then run `apply` once. `config unset NAME...` removes saved overrides and restores
+the values supplied by Docker, or the built-in defaults.
+
+`apply` validates the settings together. App variables, commands, runtime image
+and Git selection changes start a candidate, check readiness, switch traffic,
+then drain the old instance. App-variable changes keep the current commit and
+image digest. Memory, polling, health-check timing, timeout and log-retention
+changes update the supervisor without replacing the app. Git credentials are
+checked against the configured source. Failed applies keep the accepted settings
+and healthy instance; pending changes remain available to correct and retry.
+Changing app variables reruns setup because setup receives those variables too.
+
+Settings survive stopping and restarting the same container. Docker environment
+values are defaults; saved overrides take precedence. Pending changes also
+survive restart, but only accepted settings start the app. A container without
+`GIT_URL` or `RUN_COMMAND` stays running in `waiting` so you can configure it
+using these commands.
+
+The supervisor prints configuration changes, setup, startup, readiness, cutover,
+drain, exits, recovery and log collection to the console. Configuration events
+list variable names without printing their values. `status` also reports the
+short instance ID and whether configuration changes are pending.
 
 ## Additional settings
 
@@ -85,9 +124,18 @@ All of these are optional. Times are in seconds.
 | `STARTUP_TIMEOUT` | `60` | How long to wait for a new service to become healthy after setup. |
 | `HEALTH_INTERVAL` | `10` | Time between health checks and recovery retries. |
 | `HEALTH_FAILURES` | `3` | Consecutive failed checks before recovery. |
+| `SETUP_TIMEOUT` | `900` | Maximum setup time. |
+| `DRAIN_TIMEOUT` | `30` | Time allowed for existing requests and streams to finish before stopping an old instance. |
 | `DATA_DIR` | `/data` | Where the supervisor stores its Git, image, and installation cache. |
+| `CONFIG_DIR` | `/config` | Accepted settings and pending overrides. |
+| `LOG_DIR` | `/logs` | Application stdout and stderr from all instances. |
+| `LOG_RETENTION_DAYS` | `30` | Days of application logs to retain. |
+| `LOG_MAX_FILE_SIZE` | `10M` | Maximum size of each daily log page, including frontmatter. |
+| `LOG_MAX_TOTAL_SIZE` | `1G` | Maximum combined size of retained application log pages. |
 
 Memory sizes accept bytes or `K`, `M`, `G`, and `T` suffixes (1024-based).
+Log sizes use the same suffixes. The file limit must be at least `1K`, and the
+total limit must be at least the file limit. Retention days must be positive.
 The memory threshold is checked about once per second and includes the sandbox
 process tree. It triggers a normal deployment rather than enforcing a hard cap.
 
@@ -95,11 +143,42 @@ process tree. It triggers a normal deployment rather than enforcing a hard cap.
 readable by UID 10000. Only committed files are deployed; local repositories
 support commit and tag updates.
 
+## Logs and persistence
+
+App output goes to the console and files such as
+`/logs/a1b2c3d4e5f6-2026-10-06-000001.log`. Each file starts with frontmatter
+containing the instance ID, full commit, Git source, runtime image/digest,
+deployment start time and UTC day. Output identifies setup/run and stdout/stderr.
+Files rotate at midnight UTC or the size limit. Logs from stopped and failed
+instances remain until collection removes them.
+
+The collector runs every minute and on apply. It removes expired pages and the
+oldest pages needed to stay under the total limit; writes enforce the size limit
+too. Reducing the file limit also removes existing oversized pages. File logging
+errors appear on the console and are retried without stopping the application.
+
+No volume mapping is required. `/config`, `/logs` and `/data` are separate folders
+inside the container. To retain them when **recreating or removing** the container,
+add whichever mappings you need to your stack:
+
+```yaml
+volumes:
+  - easy-service-config:/config
+  - easy-service-logs:/logs
+  - easy-service-cache:/data
+```
+
+Declare those named volumes at the top level of the stack. Host bind directories
+must be writable by UID 10000. Directory locations are chosen through Docker's
+`DATA_DIR`, `CONFIG_DIR` and `LOG_DIR` settings when the container starts;
+the other settings can be changed through the CLI.
+
 ## What to expect
 
 A healthy update starts the new version before switching traffic. Failed
 candidates leave the healthy version running. Existing requests, SSE streams,
-and WebSockets have up to 30 seconds to finish on the old version.
+and WebSockets have up to `DRAIN_TIMEOUT` seconds (30 by default) to finish on
+the old version. Increase Docker's stop grace period when increasing this timeout.
 
 Crashes and failed health checks trigger one restart, followed by a fresh
 installation on another failure. Recovery keeps retrying. Application writes

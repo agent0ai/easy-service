@@ -5,11 +5,15 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log"
+	"maps"
 	"net"
 	"net/http"
 	"os"
 	"path/filepath"
+	"sort"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -34,6 +38,9 @@ type selectionResult struct {
 }
 
 func (c *Controller) execute(ctx, watchCtx context.Context, action string, refresh chan<- selectionRequest, updates <-chan revision.Selection) (string, error) {
+	if action == "apply" {
+		return c.apply(ctx, watchCtx)
+	}
 	if action == "restart" {
 		generation := c.Engine.activeGeneration()
 		if generation == 0 {
@@ -43,6 +50,9 @@ func (c *Controller) execute(ctx, watchCtx context.Context, action string, refre
 	}
 	if action != "redeploy" {
 		return "", fmt.Errorf("unknown action %q", action)
+	}
+	if c.Selector == nil {
+		return "", fmt.Errorf("set GIT_URL and RUN_COMMAND, then run config apply")
 	}
 	result := make(chan selectionResult, 1)
 	select {
@@ -65,17 +75,19 @@ func (c *Controller) execute(ctx, watchCtx context.Context, action string, refre
 	case <-updates:
 	default:
 	}
-	return selected.selection.SHA, c.Engine.deploy(ctx, watchCtx, selected.selection, nil)
+	return selected.selection.SHA, c.deploySelection(ctx, watchCtx, selected.selection)
 }
 
 type Status struct {
-	State        string `json:"state"`
-	Revision     string `json:"revision,omitempty"`
-	RuntimeImage string `json:"runtime_image"`
-	Digest       string `json:"digest,omitempty"`
-	MemoryBytes  uint64 `json:"memory_bytes"`
-	MemoryLimit  uint64 `json:"memory_limit"`
-	MemoryError  string `json:"memory_error,omitempty"`
+	Instance      string `json:"instance,omitempty"`
+	ConfigPending bool   `json:"config_pending"`
+	State         string `json:"state"`
+	Revision      string `json:"revision,omitempty"`
+	RuntimeImage  string `json:"runtime_image"`
+	Digest        string `json:"digest,omitempty"`
+	MemoryBytes   uint64 `json:"memory_bytes"`
+	MemoryLimit   uint64 `json:"memory_limit"`
+	MemoryError   string `json:"memory_error,omitempty"`
 }
 
 func (e *Engine) Status() Status {
@@ -83,6 +95,7 @@ func (e *Engine) Status() Status {
 	s := Status{State: "waiting", RuntimeImage: e.Cfg.RuntimeImage, MemoryLimit: e.Cfg.ServiceMemoryLimit}
 	a := e.active
 	if a != nil {
+		s.Instance = filepath.Base(a.Instance.RootPath())
 		s.Revision, s.Digest = a.Revision, a.Digest
 		s.State = "unhealthy"
 		if !a.Instance.Exited() && e.Proxy.Current() == a.Backend {
@@ -151,11 +164,33 @@ func (c *Controller) StartControl(ctx context.Context) (func(), error) {
 	var action sync.Mutex
 	writeStatus := func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(c.Engine.Status())
+		status := c.Engine.Status()
+		if c.Settings != nil {
+			status.ConfigPending = !maps.Equal(c.Settings.Pending(), c.Settings.Applied())
+		}
+		_ = json.NewEncoder(w).Encode(status)
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /status", writeStatus)
-	for _, name := range []string{"redeploy", "restart"} {
+	mux.HandleFunc("POST /kill-draining", func(w http.ResponseWriter, r *http.Request) {
+		// An urgent force-stop must be available while another action drains.
+		if r.Context().Err() != nil {
+			return
+		}
+		killCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		killed, err := c.Engine.KillDraining(killCtx)
+		if err != nil {
+			log.Printf("force-stop draining failed stopped=%d error=%v", killed, err)
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(struct {
+			Killed int `json:"killed"`
+		}{killed})
+	})
+	for _, name := range []string{"redeploy", "restart", "apply"} {
 		mux.HandleFunc("POST /"+name, func(w http.ResponseWriter, r *http.Request) {
 			if !action.TryLock() {
 				http.Error(w, "another action is in progress", http.StatusConflict)
@@ -174,6 +209,7 @@ func (c *Controller) StartControl(ctx context.Context) (func(), error) {
 			select {
 			case err := <-request.result:
 				if err != nil {
+					log.Printf("control action failed action=%s error=%v", name, err)
 					http.Error(w, err.Error(), http.StatusInternalServerError)
 					return
 				}
@@ -186,6 +222,69 @@ func (c *Controller) StartControl(ctx context.Context) (func(), error) {
 			writeStatus(w, r)
 		})
 	}
+	mux.HandleFunc("GET /config", func(w http.ResponseWriter, r *http.Request) {
+		if c.Settings == nil {
+			http.Error(w, "runtime configuration is unavailable", http.StatusServiceUnavailable)
+			return
+		}
+		values := c.Settings.Values(true)
+		if names := r.URL.Query()["name"]; len(names) > 0 {
+			filtered := make(map[string]string, len(names))
+			for _, name := range names {
+				value, exists := values[name]
+				if !exists {
+					http.Error(w, "unknown configuration variable "+name, http.StatusBadRequest)
+					return
+				}
+				filtered[name] = value
+			}
+			values = filtered
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(values)
+	})
+	mux.HandleFunc("POST /config", func(w http.ResponseWriter, r *http.Request) {
+		if c.Settings == nil {
+			http.Error(w, "runtime configuration is unavailable", http.StatusServiceUnavailable)
+			return
+		}
+		if !action.TryLock() {
+			http.Error(w, "another action is in progress", http.StatusConflict)
+			return
+		}
+		defer action.Unlock()
+		var patch struct {
+			Values map[string]string `json:"values"`
+			Unset  []string          `json:"unset"`
+		}
+		decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20))
+		decoder.DisallowUnknownFields()
+		if err := decoder.Decode(&patch); err != nil {
+			http.Error(w, "invalid configuration request", http.StatusBadRequest)
+			return
+		}
+		var extra any
+		if err := decoder.Decode(&extra); err != io.EOF {
+			http.Error(w, "invalid configuration request", http.StatusBadRequest)
+			return
+		}
+		if len(patch.Values)+len(patch.Unset) == 0 {
+			http.Error(w, "no configuration changes supplied", http.StatusBadRequest)
+			return
+		}
+		if err := c.Settings.Stage(patch.Values, patch.Unset); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		names := make([]string, 0, len(patch.Values)+len(patch.Unset))
+		for name := range patch.Values {
+			names = append(names, name)
+		}
+		names = append(names, patch.Unset...)
+		sort.Strings(names)
+		log.Printf("configuration staged variables=%s; run config apply to activate", strings.Join(names, ","))
+		writeStatus(w, r)
+	})
 	server := &http.Server{Handler: mux, ReadHeaderTimeout: 10 * time.Second, IdleTimeout: 30 * time.Second}
 	done := make(chan struct{})
 	stopClose := context.AfterFunc(ctx, func() { server.Close() })

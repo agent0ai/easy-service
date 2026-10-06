@@ -29,8 +29,7 @@ COPY --from=runsc /out/ /usr/local/bin/
 RUN setcap cap_net_bind_service=+ep /usr/local/bin/easy-service \
  && apt-get purge -y libcap2-bin \
  && rm -rf /var/lib/apt/lists/* \
- && mkdir /data && chown easyservice:easyservice /data
+ && mkdir /data /config /logs && chown easyservice:easyservice /data /config /logs
 USER easyservice
 EXPOSE 80
-VOLUME ["/data"]
 ENTRYPOINT ["/usr/bin/tini","--","/usr/local/bin/easy-service"]
