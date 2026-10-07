@@ -9,3 +9,7 @@ grep -q 'mkdir /data /config /logs' Dockerfile
 ! grep -q '^VOLUME' Dockerfile
 ! grep -q '/var/run/docker.sock' compose.yaml Dockerfile
 ! grep -Eq 'rootlesskit|slirp4netns|uidmap|/dev/net/tun|/etc/subuid|/etc/subgid' compose.yaml Dockerfile
+
+! grep -Eq "security_opt|privileged:|cap_add:|devices:" compose.yaml
+! grep -Eq "runsc|gvisor|^USER" Dockerfile
+grep -q "libtalloc2" Dockerfile

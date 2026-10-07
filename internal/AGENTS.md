@@ -32,7 +32,7 @@ Own the implementation contracts for revision selection, installation, isolation
 - [logs/AGENTS.md](logs/AGENTS.md): daily instance output files, rotation, retention and writer lifetime.
 - [image/AGENTS.md](image/AGENTS.md): digest resolution, OCI copy/unpack and image cache.
 - [process/AGENTS.md](process/AGENTS.md): bounded helper execution and process groups.
-- [sandbox/AGENTS.md](sandbox/AGENTS.md): rootless gVisor, filesystems and memory observation.
+- [sandbox/AGENTS.md](sandbox/AGENTS.md): PRoot/Linux UID ownership, filesystems and CPU/RAM observation.
 - [health/AGENTS.md](health/AGENTS.md): readiness and liveness probes.
 - [proxy/AGENTS.md](proxy/AGENTS.md): HTTP transport, streaming, upgrades and request drain.
 - [state/AGENTS.md](state/AGENTS.md): atomic accepted configuration/state, shared cleanup bounds and startup reconciliation.

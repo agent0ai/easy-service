@@ -1,7 +1,9 @@
 package state
 
 import (
+	"context"
 	"encoding/json"
+	"github.com/example/easy-service/internal/process"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -31,13 +33,13 @@ func TestAtomicStateRecoveryAndCleanup(t *testing.T) {
 	if legacy.Recoverable(v.GitURL, v.ImageRef) {
 		t.Fatal("legacy state without source identity was accepted for recovery")
 	}
-	for _, name := range []string{"instances", "runsc-root", "deployments"} {
+	for _, name := range []string{"instances", "runtime", "deployments"} {
 		os.MkdirAll(filepath.Join(d, name, "orphan"), 0700)
 	}
 	if e = s.Reconcile(); e != nil {
 		t.Fatal(e)
 	}
-	for _, name := range []string{"instances", "runsc-root", "deployments"} {
+	for _, name := range []string{"instances", "runtime", "deployments"} {
 		if _, e = os.Stat(filepath.Join(d, name)); !os.IsNotExist(e) {
 			t.Fatalf("orphan %s retained", name)
 		}
@@ -77,7 +79,7 @@ func reconcileProcess(t *testing.T, data, name, area string, ignoreTerm bool) (*
 		t.Fatal(err)
 	}
 	ready := filepath.Join(bundle, "running")
-	cmd := exec.Command(helper, "-test.run=TestReconcileHelperProcess", "--", "--rootless=true", "--network=host", "--file-access=exclusive", "--root", filepath.Join(data, "runsc-root", "orphan"), "run", "--bundle", bundle, "orphan")
+	cmd := exec.Command(helper, "-test.run=TestReconcileHelperProcess", "--", "--rootless=true", "--network=host", "--file-access=exclusive", "--root", filepath.Join(data, "runtime", "orphan"), "run", "--bundle", bundle, "orphan")
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	cmd.Env = []string{"EASY_SERVICE_RECONCILE_HELPER=1", "EASY_SERVICE_READY=" + ready}
 	if ignoreTerm {
@@ -102,21 +104,56 @@ func reconcileProcess(t *testing.T, data, name, area string, ignoreTerm bool) (*
 	return cmd, done
 }
 
-func TestReconcileStopsUnrecordedAndUncooperativeRuntime(t *testing.T) {
-	for _, area := range []string{"instances", "prepared"} {
-		t.Run(area, func(t *testing.T) {
-			data := t.TempDir()
-			_, done := reconcileProcess(t, data, "runsc", area, true)
-			if err := (Store{Data: data}).Reconcile(); err != nil {
-				t.Fatal(err)
-			}
-			select {
-			case <-done:
-			case <-time.After(time.Second):
-				t.Fatal("reconciliation left the orphan runtime running")
-			}
-		})
+func TestReconcileStopsOnlyOwnedUIDs(t *testing.T) {
+	if os.Geteuid() != 0 {
+		t.Skip("UID isolation requires root")
 	}
+	data, other := t.TempDir(), t.TempDir()
+	var owners []RuntimeOwner
+	var commands []*exec.Cmd
+	for _, dir := range []string{data, other} {
+		owner, err := NewRuntimeOwner(dir, "orphan")
+		if err != nil {
+			t.Fatal(err)
+		}
+		owners = append(owners, owner)
+		cmd := exec.Command("/bin/sh", "-c", "trap '' TERM; sleep 600 & wait")
+		cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true, Credential: &syscall.Credential{Uid: owner.UID, Gid: owner.UID}}
+		if err := cmd.Start(); err != nil {
+			t.Fatal(err)
+		}
+		commands = append(commands, cmd)
+		t.Cleanup(func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			defer cancel()
+			_ = process.KillUser(ctx, owner.UID)
+			_ = cmd.Wait()
+			_ = owner.Release()
+		})
+		deadline := time.Now().Add(time.Second)
+		for {
+			s, err := process.SampleUser(owner.UID)
+			if err == nil && len(s.PIDs) >= 2 {
+				break
+			}
+			if time.Now().After(deadline) {
+				t.Fatal("helper did not fork")
+			}
+			time.Sleep(time.Millisecond)
+		}
+	}
+	if err := (Store{Data: data}).Reconcile(); err != nil {
+		t.Fatal(err)
+	}
+	s, err := process.SampleUser(owners[0].UID)
+	if err != nil || len(s.PIDs) != 0 {
+		t.Fatal("owned orphan survived", s, err)
+	}
+	s, err = process.SampleUser(owners[1].UID)
+	if err != nil || len(s.PIDs) == 0 {
+		t.Fatal("unrelated supervisor was stopped", s, err)
+	}
+	_ = commands
 }
 
 func TestReconcileDoesNotSignalUnrelatedPID(t *testing.T) {

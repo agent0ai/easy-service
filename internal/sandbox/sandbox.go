@@ -3,6 +3,7 @@ package sandbox
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -19,43 +20,9 @@ import (
 
 	"github.com/example/easy-service/internal/logs"
 	"github.com/example/easy-service/internal/process"
+	"github.com/example/easy-service/internal/state"
 )
 
-type Spec struct {
-	OCIVersion string  `json:"ociVersion"`
-	Process    Process `json:"process"`
-	Root       Root    `json:"root"`
-	Mounts     []Mount `json:"mounts"`
-	Linux      Linux   `json:"linux"`
-}
-type Process struct {
-	Terminal        bool     `json:"terminal"`
-	User            User     `json:"user"`
-	Args            []string `json:"args"`
-	Env             []string `json:"env"`
-	Cwd             string   `json:"cwd"`
-	NoNewPrivileges bool     `json:"noNewPrivileges"`
-}
-type User struct {
-	UID uint32 `json:"uid"`
-	GID uint32 `json:"gid"`
-}
-type Root struct {
-	Path     string `json:"path"`
-	Readonly bool   `json:"readonly"`
-}
-type Mount struct {
-	Destination string   `json:"destination"`
-	Type        string   `json:"type"`
-	Source      string   `json:"source"`
-	Options     []string `json:"options,omitempty"`
-}
-type Linux struct {
-	Namespaces []Namespace `json:"namespaces"`
-}
-type Namespace struct {
-	Type string `json:"type"`
-}
 type Instance struct {
 	ID, Bundle, Root string
 	Port             int
@@ -63,6 +30,12 @@ type Instance struct {
 	done             chan error
 	waitErr          error
 	once             sync.Once
+	owner            state.RuntimeOwner
+	sampleMu         sync.Mutex
+	sampledAt        time.Time
+	startedAt        time.Time
+	sampledTicks     uint64
+	usage            process.Usage
 }
 type Runtime struct {
 	Data           string
@@ -73,15 +46,11 @@ type Runtime struct {
 }
 
 func Validate() error {
-	if _, e := exec.LookPath("runsc"); e != nil {
-		return fmt.Errorf("mandatory rootless gVisor prerequisite runsc not found")
+	if os.Geteuid() != 0 {
+		return fmt.Errorf("the supervisor must run as root; workloads use separate unprivileged users")
 	}
-	if _, e := os.Stat("/proc/self/ns/user"); e != nil {
-		return fmt.Errorf("user namespaces unavailable: %w", e)
-	}
-	b, e := os.ReadFile("/proc/sys/kernel/unprivileged_userns_clone")
-	if e == nil && strings.TrimSpace(string(b)) == "0" {
-		return fmt.Errorf("unprivileged user namespaces are disabled")
+	if _, err := exec.LookPath("proot"); err != nil {
+		return fmt.Errorf("mandatory runtime prerequisite proot not found")
 	}
 	return nil
 }
@@ -97,8 +66,11 @@ func CopyTree(ctx context.Context, src, dst string) error {
 }
 func (r Runtime) Prepare(ctx context.Context, id, base, checkout, setup string, env []string) (result string, err error) {
 	dir := filepath.Join(r.Data, "prepared", id)
+	if r.inUse(dir) {
+		return "", fmt.Errorf("prepared filesystem is still in use")
+	}
 	defer func() {
-		if err != nil {
+		if err != nil && !r.inUse(dir) {
 			_ = os.RemoveAll(dir)
 		}
 	}()
@@ -130,8 +102,11 @@ func (r Runtime) Prepare(ctx context.Context, id, base, checkout, setup string, 
 		}
 		e = i.Wait(op)
 		stopCtx, stopCancel := context.WithTimeout(context.Background(), 10*time.Second)
-		_ = i.Stop(stopCtx)
+		stopErr := i.Stop(stopCtx)
 		stopCancel()
+		if stopErr != nil {
+			return "", errors.Join(e, fmt.Errorf("stop setup: %w", stopErr))
+		}
 		_ = os.RemoveAll(i.RootPath())
 		if e != nil {
 			return "", fmt.Errorf("setup failed: %w", e)
@@ -143,6 +118,9 @@ func (r Runtime) Prepare(ctx context.Context, id, base, checkout, setup string, 
 	return dir, nil
 }
 func (r Runtime) ValidatePrepared(dir string) error {
+	if r.inUse(dir) {
+		return fmt.Errorf("prepared filesystem is still in use")
+	}
 	for _, path := range []string{filepath.Join(dir, ".easy-service-ready"), filepath.Join(dir, "rootfs"), filepath.Join(dir, "rootfs", "app")} {
 		if st, err := os.Stat(path); err != nil || (path != filepath.Join(dir, ".easy-service-ready") && !st.IsDir()) {
 			return fmt.Errorf("prepared installation invalid at %s", filepath.Base(path))
@@ -150,9 +128,18 @@ func (r Runtime) ValidatePrepared(dir string) error {
 	}
 	return nil
 }
+
+func (r Runtime) inUse(bundle string) bool {
+	for _, instance := range r.List() {
+		if instance.BundlePath() == bundle {
+			return true
+		}
+	}
+	return false
+}
 func (r Runtime) Start(ctx, lifetime context.Context, id, prepared, command string, env []string) (*Instance, error) {
 	bundle := filepath.Join(r.Data, "instances", id)
-	root := filepath.Join(r.Data, "runsc-root", id)
+	root := filepath.Join(r.Data, "runtime", id)
 	ok := false
 	defer func() {
 		if !ok {
@@ -174,137 +161,190 @@ func (r Runtime) Start(ctx, lifetime context.Context, id, prepared, command stri
 	return i, err
 }
 func (r Runtime) Restart(ctx context.Context, id, bundle, command string, env []string) (*Instance, error) {
-	root := filepath.Join(r.Data, "runsc-root", id)
+	root := filepath.Join(r.Data, "runtime", id)
 	i, err := r.start(ctx, id, bundle, command, env)
 	if err != nil {
 		_ = os.RemoveAll(root)
 	}
 	return i, err
 }
+func (i *Instance) Identity() string { return i.ID }
+
 func (i *Instance) PID() int {
 	if i.cmd == nil || i.cmd.Process == nil {
 		return 0
 	}
 	return i.cmd.Process.Pid
 }
-func (i *Instance) MemoryUsage() (uint64, error) { return processTreeRSS(i.PID()) }
+func (i *Instance) Usage() (process.Usage, error) {
+	i.sampleMu.Lock()
+	defer i.sampleMu.Unlock()
+	now := time.Now()
+	if !i.sampledAt.IsZero() && now.Sub(i.sampledAt) < 200*time.Millisecond {
+		return i.usage, nil
+	}
+	sample, err := process.SampleUser(i.owner.UID)
+	if err != nil {
+		return process.Usage{}, err
+	}
+	if len(sample.PIDs) == 0 {
+		return process.Usage{}, fmt.Errorf("instance processes are not running")
+	}
+	usage := process.Usage{MemoryBytes: sample.MemoryBytes}
+	previous := i.sampledAt
+	if previous.IsZero() {
+		previous = i.startedAt
+	}
+	if !previous.IsZero() && sample.CPUTicks >= i.sampledTicks {
+		// Linux amd64 and arm64 expose /proc CPU time in USER_HZ (100 ticks/sec).
+		usage.CPUPercent = float64(sample.CPUTicks-i.sampledTicks) / now.Sub(previous).Seconds()
+	}
+	i.sampledAt, i.sampledTicks, i.usage = now, sample.CPUTicks, usage
+	return usage, nil
+}
 
-func processTreeRSS(root int) (uint64, error) {
-	if root <= 1 {
-		return 0, fmt.Errorf("sandbox process is not running")
-	}
-	type child struct{ pid, parent int }
-	pending := []child{{root, 0}}
-	seen := make(map[int]bool)
-	var total uint64
-	for len(pending) > 0 {
-		next := pending[len(pending)-1]
-		pending = pending[:len(pending)-1]
-		if seen[next.pid] {
-			continue
+var live sync.Map
+
+func (r Runtime) List() []*Instance {
+	data, _ := filepath.Abs(r.Data)
+	var instances []*Instance
+	live.Range(func(_, value any) bool {
+		i := value.(*Instance)
+		if filepath.Dir(i.Root) == filepath.Join(data, "runtime") && !i.Exited() {
+			instances = append(instances, i)
 		}
-		seen[next.pid] = true
-		dir := filepath.Join("/proc", strconv.Itoa(next.pid))
-		stat, err := os.ReadFile(filepath.Join(dir, "stat"))
-		if err != nil {
-			if next.pid == root {
-				return 0, err
-			}
-			continue
-		}
-		closeParen := strings.LastIndexByte(string(stat), ')')
-		if closeParen < 0 {
-			continue
-		}
-		fields := strings.Fields(string(stat[closeParen+1:]))
-		if len(fields) < 22 {
-			continue
-		}
-		parent, _ := strconv.Atoi(fields[1])
-		if next.parent != 0 && parent != next.parent {
-			continue // a short-lived child PID was reused outside our tree
-		}
-		pages, err := strconv.ParseUint(fields[21], 10, 64)
-		if err != nil {
-			return 0, fmt.Errorf("invalid sandbox RSS: %w", err)
-		}
-		total += pages * uint64(os.Getpagesize())
-		// A process can fork from any thread. The leader's children file alone
-		// would miss subprocesses started by other runsc threads.
-		tasks, err := os.ReadDir(filepath.Join(dir, "task"))
-		if err != nil {
-			continue
-		}
-		for _, task := range tasks {
-			children, err := os.ReadFile(filepath.Join(dir, "task", task.Name(), "children"))
-			if err != nil {
-				continue
-			}
-			for _, raw := range strings.Fields(string(children)) {
-				pid, err := strconv.Atoi(raw)
-				if err == nil && pid > 1 {
-					pending = append(pending, child{pid, next.pid})
-				}
-			}
-		}
-	}
-	return total, nil
+		return true
+	})
+	return instances
 }
 func (i *Instance) Endpoint() string   { return fmt.Sprintf("http://127.0.0.1:%d", i.Port) }
 func (i *Instance) BundlePath() string { return i.Bundle }
 func (i *Instance) RootPath() string   { return i.Root }
 func (i *Instance) Done() <-chan error { return i.done }
 func (r Runtime) start(ctx context.Context, id, bundle, command string, env []string) (*Instance, error) {
-	if e := os.MkdirAll(bundle, 0700); e != nil {
-		return nil, e
+	if err := Validate(); err != nil {
+		return nil, err
 	}
-	l, e := net.Listen("tcp", "127.0.0.1:0")
-	if e != nil {
-		return nil, e
+	data, err := filepath.Abs(r.Data)
+	if err != nil {
+		return nil, err
 	}
-	port := l.Addr().(*net.TCPAddr).Port
-	// ponytail: release before the app binds; use socket activation if atomic handoff is needed.
-	if e := l.Close(); e != nil {
-		return nil, e
-	}
-	tmp, e := filepath.Abs(filepath.Join(bundle, "rootfs", "tmp"))
-	if e != nil {
-		return nil, e
-	}
-	// Bind our own disk directory: runsc overlays an otherwise empty /tmp
-	// with an internal tmpfs. Never follow an image symlink on the host.
-	if st, e := os.Lstat(tmp); e == nil && st.Mode()&os.ModeSymlink != 0 {
-		if e := os.Remove(tmp); e != nil {
-			return nil, e
+	for parent := filepath.Dir(data); ; parent = filepath.Dir(parent) {
+		st, err := os.Stat(parent)
+		if err != nil || st.Mode().Perm()&0001 == 0 {
+			return nil, fmt.Errorf("DATA_DIR parent must permit directory traversal: %s", parent)
+		}
+		if parent == "/" {
+			break
 		}
 	}
-	if e := os.MkdirAll(tmp, 0700); e != nil {
-		return nil, e
+	for _, path := range []string{data, filepath.Join(data, "instances"), filepath.Join(data, "prepared"), filepath.Join(data, "runtime")} {
+		if err := os.MkdirAll(path, 0711); err != nil {
+			return nil, err
+		}
+		if err := os.Chmod(path, 0711); err != nil {
+			return nil, err
+		}
 	}
-	if e := os.Chmod(tmp, 0777|os.ModeSticky); e != nil {
-		return nil, e
+	bundle, err = filepath.Abs(bundle)
+	if err != nil {
+		return nil, err
 	}
-	spec := Spec{OCIVersion: "1.0.2", Process: Process{User: User{0, 0}, Args: []string{"/bin/sh", "-c", command}, Env: workloadEnv(r.ImageEnv, env, port), Cwd: "/app", NoNewPrivileges: true}, Root: Root{"rootfs", false}, Mounts: []Mount{{"/proc", "proc", "proc", nil}, {"/dev", "tmpfs", "tmpfs", []string{"nosuid", "strictatime", "mode=755", "size=65536k"}}}, Linux: Linux{[]Namespace{{"pid"}, {"ipc"}, {"uts"}, {"mount"}}}}
-	spec.Mounts = append(spec.Mounts, Mount{"/tmp", "bind", tmp, []string{"bind", "nosuid", "nodev"}})
-	// Share Docker's DNS configuration without exposing its writable host file.
-	dns, e := filepath.Abs(filepath.Join(bundle, "resolv.conf"))
-	if e != nil {
-		return nil, e
+	if err := os.MkdirAll(bundle, 0711); err != nil {
+		return nil, err
 	}
-	resolver, e := os.ReadFile("/etc/resolv.conf")
-	if e != nil {
-		return nil, e
+	if err := os.Chmod(bundle, 0711); err != nil {
+		return nil, err
 	}
-	if e := os.WriteFile(dns, resolver, 0600); e != nil {
-		return nil, e
+	owner, err := state.NewRuntimeOwner(data, id)
+	if err != nil {
+		return nil, err
 	}
-	spec.Mounts = append(spec.Mounts, Mount{"/etc/resolv.conf", "bind", dns, []string{"bind", "ro", "nosuid", "nodev", "noexec"}})
-	b, _ := json.Marshal(spec)
-	if e := os.WriteFile(filepath.Join(bundle, "config.json"), b, 0600); e != nil {
-		return nil, e
+	started := false
+	defer func() {
+		if !started {
+			_ = owner.Release()
+			_ = os.RemoveAll(owner.Root)
+		}
+	}()
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		return nil, err
 	}
-	root := filepath.Join(r.Data, "runsc-root", id)
-	cmd := process.Command(ctx, "runsc", "--rootless=true", "--platform=systrap", "--directfs=false", "--overlay2=none", "--network=host", "--file-access=exclusive", "--root", root, "run", "--bundle", bundle, id)
+	port := listener.Addr().(*net.TCPAddr).Port
+	// ponytail: release before the app binds; use socket activation if atomic handoff is needed.
+	if err := listener.Close(); err != nil {
+		return nil, err
+	}
+	rootfs := filepath.Join(bundle, "rootfs")
+	tmp := filepath.Join(rootfs, "tmp")
+	if st, err := os.Lstat(tmp); err == nil && st.Mode()&os.ModeSymlink != 0 {
+		if err := os.Remove(tmp); err != nil {
+			return nil, err
+		}
+	}
+	if err := os.MkdirAll(tmp, 0700); err != nil {
+		return nil, err
+	}
+	if err := os.Chmod(tmp, 0777|os.ModeSticky); err != nil {
+		return nil, err
+	}
+	traceTmp := filepath.Join(owner.Root, "tmp")
+	if err := os.Mkdir(traceTmp, 0700); err != nil {
+		return nil, err
+	}
+	uid := strconv.FormatUint(uint64(owner.UID), 10)
+	if b, err := process.Output(process.Command(ctx, "chown", "-hR", uid+":"+uid, "--", rootfs, traceTmp)); err != nil {
+		return nil, fmt.Errorf("own instance filesystem: %w: %s", err, b)
+	}
+	if err := os.Chmod(rootfs, 0700); err != nil {
+		return nil, err
+	}
+	resolver, err := os.ReadFile("/etc/resolv.conf")
+	if err != nil {
+		return nil, err
+	}
+	dns := filepath.Join(owner.Root, "resolv.conf")
+	if err := os.WriteFile(dns, resolver, 0444); err != nil {
+		return nil, err
+	}
+	proot, err := exec.LookPath("proot")
+	if err != nil {
+		return nil, err
+	}
+	proot, err = filepath.Abs(proot)
+	if err != nil {
+		return nil, err
+	}
+	binary, err := os.Executable()
+	if err != nil {
+		return nil, err
+	}
+	launch := launchConfig{UID: owner.UID, Rootfs: rootfs, DNS: dns, Temp: traceTmp, Proot: proot, Binary: binary, Command: command, Env: workloadEnv(r.ImageEnv, env, port)}
+	body, err := json.Marshal(launch)
+	if err != nil {
+		return nil, err
+	}
+	path := filepath.Join(owner.Root, "launch.json")
+	if err := state.AtomicWrite(path, body); err != nil {
+		return nil, err
+	}
+	descriptor, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer descriptor.Close()
+	cmd := process.Command(ctx, binary, "__runtime", "launch")
+	cmd.Cancel = func() error {
+		stop, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		uidErr := process.SignalUser(stop, owner.UID, syscall.SIGKILL)
+		return errors.Join(uidErr, cmd.Process.Kill())
+	}
+	cmd.Env = []string{"PATH=/usr/bin:/bin"}
+	cmd.ExtraFiles = []*os.File{descriptor}
+	cmd.SysProcAttr.Setpgid = false
+	cmd.SysProcAttr.Setsid = true
 	phase, logID := "run", id
 	if strings.HasPrefix(id, "setup-") {
 		phase, logID = "setup", strings.TrimPrefix(id, "setup-")
@@ -315,16 +355,32 @@ func (r Runtime) start(ctx context.Context, id, bundle, command string, env []st
 		cmd.Stdout = &prefixWriter{r.Stdout, "[" + logID + "][" + phase + "][stdout] "}
 		cmd.Stderr = &prefixWriter{r.Stderr, "[" + logID + "][" + phase + "][stderr] "}
 	}
-	if e := cmd.Start(); e != nil {
+	if err := cmd.Start(); err != nil {
 		if r.Logs != nil {
 			r.Logs.Release(logID)
 		}
-		return nil, e
+		return nil, err
 	}
-	i := &Instance{ID: id, Bundle: bundle, Root: root, Port: port, cmd: cmd, done: make(chan error)}
+	started = true
+	i := &Instance{ID: logID, Bundle: bundle, Root: owner.Root, Port: port, cmd: cmd, done: make(chan error), owner: owner, startedAt: time.Now()}
+	live.Store(owner.Root, i)
 	go func() {
-		i.waitErr = process.Wait(cmd)
+		i.waitErr = cmd.Wait()
+		for {
+			cleanup, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			err := process.KillUser(cleanup, owner.UID)
+			cancel()
+			if err == nil {
+				break
+			}
+			log.Printf("instance process cleanup blocked instance=%s error=%v", logID, err)
+			time.Sleep(time.Second)
+		}
+		if err := owner.Release(); err != nil {
+			log.Printf("instance UID release failed instance=%s error=%v", logID, err)
+		}
 		close(i.done)
+		live.Delete(owner.Root)
 		if r.Logs != nil {
 			r.Logs.Release(logID)
 		}
@@ -369,50 +425,52 @@ func (i *Instance) Exited() bool {
 		return false
 	}
 }
+func (i *Instance) signal(ctx context.Context, sig syscall.Signal) error {
+	if i.Exited() {
+		return nil
+	}
+	// os.Process uses a pidfd on supported Linux kernels, including Hostinger's.
+	// This also covers the short root-owned launcher phase before UID switching.
+	var parentErr error
+	uidErr := process.SignalUser(ctx, i.owner.UID, sig)
+	if i.cmd != nil && i.cmd.Process != nil {
+		parentErr = i.cmd.Process.Signal(sig)
+	}
+	if errors.Is(parentErr, os.ErrProcessDone) {
+		parentErr = nil
+	}
+	return errors.Join(parentErr, uidErr)
+}
 func (i *Instance) Stop(ctx context.Context) error {
 	if i.Exited() {
-		return nil // a stale PID may now belong to a different process group
+		return nil
 	}
-	i.once.Do(func() {
-		if i.cmd.Process != nil {
-			_ = syscall.Kill(-i.cmd.Process.Pid, syscall.SIGTERM)
-		}
-	})
+	var err error
+	i.once.Do(func() { err = i.signal(ctx, syscall.SIGTERM) })
+	if err != nil && ctx.Err() == nil {
+		return err
+	}
 	select {
 	case <-i.done:
 		return nil
 	case <-ctx.Done():
-		if i.cmd.Process != nil {
-			_ = syscall.Kill(-i.cmd.Process.Pid, syscall.SIGKILL)
-		}
-		// Killing is asynchronous. Reap before callers reuse or remove the
-		// installation, allowing for Command's one-second output-pipe deadline.
-		t := time.NewTimer(2 * time.Second)
-		defer t.Stop()
-		select {
-		case <-i.done:
-			return nil
-		case <-t.C:
-			return fmt.Errorf("sandbox did not finish after forced stop: %w", ctx.Err())
-		}
+		forced, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		return i.Kill(forced)
 	}
 }
-
-// Kill is reserved for an explicit force-stop of a retired instance.
 func (i *Instance) Kill(ctx context.Context) error {
 	if i.Exited() {
 		return nil
 	}
-	if i.cmd.Process != nil {
-		if err := syscall.Kill(-i.cmd.Process.Pid, syscall.SIGKILL); err != nil && err != syscall.ESRCH {
-			return err
-		}
+	if err := i.signal(ctx, syscall.SIGKILL); err != nil {
+		return err
 	}
 	select {
 	case <-i.done:
 		return nil
 	case <-ctx.Done():
-		return fmt.Errorf("sandbox did not finish after kill: %w", ctx.Err())
+		return fmt.Errorf("instance did not finish after kill: %w", ctx.Err())
 	}
 }
 

@@ -20,12 +20,14 @@ import (
 	"github.com/example/easy-service/internal/config"
 	"github.com/example/easy-service/internal/health"
 	"github.com/example/easy-service/internal/logs"
+	"github.com/example/easy-service/internal/process"
 	"github.com/example/easy-service/internal/proxy"
 	"github.com/example/easy-service/internal/revision"
 	"github.com/example/easy-service/internal/state"
 )
 
 type Instance interface {
+	Identity() string
 	Exited() bool
 	Done() <-chan error
 	Stop(context.Context) error
@@ -33,9 +35,10 @@ type Instance interface {
 	Endpoint() string
 	BundlePath() string
 	RootPath() string
-	MemoryUsage() (uint64, error)
+	Usage() (process.Usage, error)
 }
 type Runtime interface {
+	List() []Instance
 	Prepare(context.Context, string, string, string, string, []string) (string, error)
 	ValidatePrepared(string) error
 	// Start separates filesystem-operation cancellation from process lifetime.
@@ -112,7 +115,7 @@ func (e *Engine) nextID() (string, error) {
 			continue
 		}
 		available := true
-		for _, dir := range []string{"instances", "runsc-root", "deployments"} {
+		for _, dir := range []string{"instances", "runtime", "deployments"} {
 			if _, err := os.Lstat(filepath.Join(e.Cfg.DataDir, dir, id)); err == nil {
 				available = false
 				break
@@ -405,6 +408,13 @@ func drainTimeout(cfg config.Config, fallback time.Duration) time.Duration {
 }
 
 func (e *Engine) invalidatePrepared(path string) {
+	if e.Runtime != nil {
+		for _, instance := range e.Runtime.List() {
+			if instance.BundlePath() == path && !instance.Exited() {
+				return
+			}
+		}
+	}
 	root := filepath.Join(e.Cfg.DataDir, "prepared")
 	if state.Within(root, path) {
 		_ = os.RemoveAll(path)
@@ -419,7 +429,7 @@ func (e *Engine) removeOtherPrepared(keep ...string) {
 	for _, entry := range entries {
 		path := filepath.Join(root, entry.Name())
 		if !slices.Contains(keep, path) && state.Within(root, path) {
-			_ = os.RemoveAll(path)
+			e.invalidatePrepared(path)
 		}
 	}
 }
@@ -428,7 +438,7 @@ func preparedID(sha, digest string, cfg config.Config) string {
 		Version            int
 		SHA, Digest, Setup string
 		Env                []string
-	}{2, sha, digest, cfg.SetupCommand, cfg.AppEnv}
+	}{3, sha, digest, cfg.SetupCommand, cfg.AppEnv}
 	b, _ := json.Marshal(inputs)
 	h := sha256.Sum256(b)
 	return hex.EncodeToString(h[:])
@@ -468,7 +478,7 @@ func (e *Engine) recover(ctx, watchCtx context.Context, generation uint64, force
 	var err error
 	prepared := a.Prepared
 	if restarted {
-		e.removeInstancePath(filepath.Join(e.Cfg.DataDir, "runsc-root"), old.RootPath())
+		e.removeInstancePath(filepath.Join(e.Cfg.DataDir, "runtime"), old.RootPath())
 		e.registerLog(id, id, a.Revision, e.snapshot())
 		inst, err = e.Runtime.Restart(e.runtimeContext(watchCtx), id, old.BundlePath(), e.Cfg.RunCommand, e.Cfg.AppEnv)
 		log.Printf("restarting revision %s using existing writable installation", a.Revision)
@@ -555,13 +565,13 @@ func (e *Engine) watch(ctx context.Context, a *Active) {
 				case <-instance.Done():
 					return
 				case <-ticker.C:
-					used, err := instance.MemoryUsage()
+					usage, err := instance.Usage()
 					if err != nil {
 						log.Printf("deployment memory sample failed: %v", err)
 						continue
 					}
-					if used > cfg.ServiceMemoryLimit {
-						log.Printf("memory threshold exceeded revision=%s used=%d limit=%d", a.Revision, used, cfg.ServiceMemoryLimit)
+					if usage.MemoryBytes > cfg.ServiceMemoryLimit {
+						log.Printf("memory threshold exceeded revision=%s used=%d limit=%d", a.Revision, usage.MemoryBytes, cfg.ServiceMemoryLimit)
 						select {
 						case e.MemoryExceeded <- generation:
 						case <-ctx.Done():
@@ -615,7 +625,7 @@ func (e *Engine) cleanup(i Instance, bundle bool) {
 	e.mu.Lock()
 	data := e.Cfg.DataDir
 	e.mu.Unlock()
-	e.removeInstancePath(filepath.Join(data, "runsc-root"), i.RootPath())
+	e.removeInstancePath(filepath.Join(data, "runtime"), i.RootPath())
 	if bundle {
 		e.removeInstancePath(filepath.Join(data, "instances"), i.BundlePath())
 	}

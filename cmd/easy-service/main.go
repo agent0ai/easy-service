@@ -29,7 +29,22 @@ func (r runtimeAdapter) Start(c, lifetime context.Context, a, b, d string, e []s
 func (r runtimeAdapter) Restart(c context.Context, a, b, d string, e []string) (supervisor.Instance, error) {
 	return r.Runtime.Restart(c, a, b, d, e)
 }
+func (r runtimeAdapter) List() []supervisor.Instance {
+	var out []supervisor.Instance
+	for _, i := range r.Runtime.List() {
+		out = append(out, i)
+	}
+	return out
+}
 func main() {
+	if handled, err := sandbox.Child(os.Args[1:]); handled {
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		return
+	}
+
 	if len(os.Args) > 1 {
 		if err := cli(os.Args[1:], os.Stdin, os.Stdout); err != nil {
 			fmt.Fprintln(os.Stderr, err)
@@ -61,7 +76,7 @@ func main() {
 		log.Fatal(err)
 	}
 	if err = sandbox.Validate(); err != nil {
-		log.Fatalf("gVisor isolation unavailable: %v", err)
+		log.Fatalf("runtime unavailable: %v", err)
 	}
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
 	defer cancel()

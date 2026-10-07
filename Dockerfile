@@ -7,29 +7,19 @@ COPY cmd ./cmd
 COPY internal ./internal
 RUN CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH go build -trimpath -ldflags='-s -w' -o /out/easy-service ./cmd/easy-service
 
-FROM debian:bookworm-slim AS runsc
-ARG TARGETARCH
-ARG GVISOR_RELEASE=release/latest
-RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl zstd && rm -rf /var/lib/apt/lists/* \
- && case "$TARGETARCH" in amd64) arch=x86_64;; arm64) arch=aarch64;; *) exit 1;; esac \
- && base="https://storage.googleapis.com/gvisor/releases/${GVISOR_RELEASE}/${arch}" \
- && curl -fsSLo /gvisor.tar.zstd "$base/gvisor.tar.zstd" \
- && curl -fsSLo /gvisor.tar.zstd.sha512 "$base/gvisor.tar.zstd.sha512" \
- && (cd / && sha512sum -c gvisor.tar.zstd.sha512) \
- && mkdir /out && tar --zstd -xf /gvisor.tar.zstd -C /out \
- && rm -f /out/containerd-shim-runsc-v1
+FROM debian:bookworm-slim AS proot
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl build-essential libtalloc-dev \
+ && curl -fsSLo /proot.tar.gz https://codeload.github.com/proot-me/proot/tar.gz/refs/tags/v5.5.0 \
+ && echo '287cfb27f58e100b0153006cb352268225bb9ad9d41d9b52ed56d01a22c13e6f  /proot.tar.gz' | sha256sum -c - \
+ && mkdir /src && tar -xzf /proot.tar.gz -C /src --strip-components=1 \
+ && make -C /src/src loader.elf build.h && make -C /src/src proot
 
 FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      ca-certificates git skopeo umoci tini coreutils libcap2-bin \
+      ca-certificates git skopeo umoci tini coreutils libtalloc2 \
  && rm -rf /var/lib/apt/lists/* \
- && useradd --uid 10000 --create-home --shell /usr/sbin/nologin easyservice
+ && mkdir /data /config /logs && chmod 700 /data /config /logs
 COPY --from=build /out/easy-service /usr/local/bin/easy-service
-COPY --from=runsc /out/ /usr/local/bin/
-RUN setcap cap_net_bind_service=+ep /usr/local/bin/easy-service \
- && apt-get purge -y libcap2-bin \
- && rm -rf /var/lib/apt/lists/* \
- && mkdir /data /config /logs && chown easyservice:easyservice /data /config /logs
-USER easyservice
+COPY --from=proot /src/src/proot /usr/local/bin/proot
 EXPOSE 80
 ENTRYPOINT ["/usr/bin/tini","--","/usr/local/bin/easy-service"]

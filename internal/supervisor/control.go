@@ -18,6 +18,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/example/easy-service/internal/process"
 	"github.com/example/easy-service/internal/revision"
 )
 
@@ -79,23 +80,37 @@ func (c *Controller) execute(ctx, watchCtx context.Context, action string, refre
 }
 
 type Status struct {
-	Instance      string `json:"instance,omitempty"`
-	ConfigPending bool   `json:"config_pending"`
-	State         string `json:"state"`
-	Revision      string `json:"revision,omitempty"`
-	RuntimeImage  string `json:"runtime_image"`
-	Digest        string `json:"digest,omitempty"`
-	MemoryBytes   uint64 `json:"memory_bytes"`
-	MemoryLimit   uint64 `json:"memory_limit"`
-	MemoryError   string `json:"memory_error,omitempty"`
+	Instance      string           `json:"instance,omitempty"`
+	ConfigPending bool             `json:"config_pending"`
+	State         string           `json:"state"`
+	Revision      string           `json:"revision,omitempty"`
+	RuntimeImage  string           `json:"runtime_image"`
+	Digest        string           `json:"digest,omitempty"`
+	MemoryBytes   uint64           `json:"memory_bytes"`
+	MemoryLimit   uint64           `json:"memory_limit"`
+	ResourceError string           `json:"resource_error,omitempty"`
+	CPUPercent    float64          `json:"cpu_percent"`
+	Instances     []InstanceStatus `json:"instances,omitempty"`
+}
+
+type InstanceStatus struct {
+	ID    string `json:"id"`
+	State string `json:"state"`
+	process.Usage
+	Error string `json:"error,omitempty"`
 }
 
 func (e *Engine) Status() Status {
 	e.mu.Lock()
 	s := Status{State: "waiting", RuntimeImage: e.Cfg.RuntimeImage, MemoryLimit: e.Cfg.ServiceMemoryLimit}
-	a := e.active
+	a, rt := e.active, e.Runtime
+	draining := make(map[string]bool, len(e.draining))
+	for _, retired := range e.draining {
+		draining[retired.instance.RootPath()] = true
+	}
 	if a != nil {
-		s.Instance = filepath.Base(a.Instance.RootPath())
+		s.Instance = a.Instance.Identity()
+		s.ResourceError = "instance processes are not running"
 		s.Revision, s.Digest = a.Revision, a.Digest
 		s.State = "unhealthy"
 		if !a.Instance.Exited() && e.Proxy.Current() == a.Backend {
@@ -103,13 +118,32 @@ func (e *Engine) Status() Status {
 		}
 	}
 	e.mu.Unlock()
-	if a != nil {
-		var err error
-		s.MemoryBytes, err = a.Instance.MemoryUsage()
-		if err != nil {
-			s.MemoryError = err.Error()
+	if rt != nil {
+		for _, i := range rt.List() {
+			phase := "candidate"
+			id := i.Identity()
+			if strings.HasPrefix(filepath.Base(i.RootPath()), "setup-") {
+				phase = "setup"
+			}
+			if draining[i.RootPath()] {
+				phase = "draining"
+			}
+			if a != nil && i.RootPath() == a.Instance.RootPath() {
+				phase = s.State
+			}
+			row := InstanceStatus{ID: id, State: phase}
+			usage, err := i.Usage()
+			row.Usage = usage
+			if err != nil {
+				row.Error = err.Error()
+			}
+			s.Instances = append(s.Instances, row)
+			if a != nil && i.RootPath() == a.Instance.RootPath() {
+				s.MemoryBytes, s.CPUPercent, s.ResourceError = usage.MemoryBytes, usage.CPUPercent, row.Error
+			}
 		}
 	}
+	sort.Slice(s.Instances, func(i, j int) bool { return s.Instances[i].ID < s.Instances[j].ID })
 	return s
 }
 

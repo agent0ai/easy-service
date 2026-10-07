@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"github.com/example/easy-service/internal/config"
 	"github.com/example/easy-service/internal/health"
+	"github.com/example/easy-service/internal/process"
 	"github.com/example/easy-service/internal/proxy"
 	"github.com/example/easy-service/internal/revision"
 	"github.com/example/easy-service/internal/sandbox"
@@ -24,11 +25,14 @@ import (
 
 type fi struct {
 	id       string
+	bundle   string
 	ex       atomic.Bool
 	done     chan error
 	mem      uint64
 	stopOnce sync.Once
 }
+
+func (i *fi) Identity() string { return i.id }
 
 func (i *fi) Exited() bool                   { return i.ex.Load() }
 func (i *fi) Done() <-chan error             { return i.done }
@@ -40,14 +44,39 @@ func (i *fi) Stop(context.Context) error {
 	})
 	return nil
 }
-func (i *fi) Endpoint() string             { return "http://127.0.0.1:1" }
-func (i *fi) BundlePath() string           { return "/tmp/b" }
-func (i *fi) RootPath() string             { return "/tmp/r" }
-func (i *fi) MemoryUsage() (uint64, error) { return i.mem, nil }
+func (i *fi) Endpoint() string { return "http://127.0.0.1:1" }
+func (i *fi) BundlePath() string {
+	if i.bundle != "" {
+		return i.bundle
+	}
+	return "/tmp/b"
+}
+func (i *fi) RootPath() string              { return filepath.Join("/tmp/r", i.id) }
+func (i *fi) Usage() (process.Usage, error) { return process.Usage{MemoryBytes: i.mem}, nil }
 
 type unstoppableInstance struct {
 	*fi
 	bundle, root string
+}
+
+func TestLivePreparationSurvivesCacheCollection(t *testing.T) {
+	e, r := engineFor(t, fakeHealth{})
+	bundle := filepath.Join(e.Cfg.DataDir, "prepared", "busy")
+	if err := os.MkdirAll(bundle, 0700); err != nil {
+		t.Fatal(err)
+	}
+	i := &fi{bundle: bundle, done: make(chan error)}
+	r.instances = append(r.instances, i)
+	e.invalidatePrepared(bundle)
+	e.removeOtherPrepared()
+	if _, err := os.Stat(bundle); err != nil {
+		t.Fatal("collected a live setup filesystem:", err)
+	}
+	i.Stop(context.Background())
+	e.removeOtherPrepared()
+	if _, err := os.Stat(bundle); !os.IsNotExist(err) {
+		t.Fatal("retained a completed setup filesystem:", err)
+	}
 }
 
 func (i *unstoppableInstance) Stop(context.Context) error { return errors.New("process did not stop") }
@@ -56,7 +85,7 @@ func (i *unstoppableInstance) RootPath() string           { return i.root }
 
 func TestFailedStopPreservesFilesystemAndRestartAllowance(t *testing.T) {
 	e, r := engineFor(t, health.New(time.Second, "/"))
-	i := &unstoppableInstance{fi: &fi{done: make(chan error)}, bundle: filepath.Join(e.Cfg.DataDir, "instances", "live"), root: filepath.Join(e.Cfg.DataDir, "runsc-root", "live")}
+	i := &unstoppableInstance{fi: &fi{done: make(chan error)}, bundle: filepath.Join(e.Cfg.DataDir, "instances", "live"), root: filepath.Join(e.Cfg.DataDir, "runtime", "live")}
 	for _, path := range []string{i.bundle, i.root} {
 		if err := os.MkdirAll(path, 0700); err != nil {
 			t.Fatal(err)
@@ -86,7 +115,7 @@ func TestKillAllRetiredInstancesKeepsActiveAndCleansFailedStops(t *testing.T) {
 	var retired []*unstoppableInstance
 	for n := range 2 {
 		id := fmt.Sprintf("retired%d", n)
-		i := &unstoppableInstance{fi: &fi{done: make(chan error)}, bundle: filepath.Join(e.Cfg.DataDir, "instances", id), root: filepath.Join(e.Cfg.DataDir, "runsc-root", id)}
+		i := &unstoppableInstance{fi: &fi{done: make(chan error)}, bundle: filepath.Join(e.Cfg.DataDir, "instances", id), root: filepath.Join(e.Cfg.DataDir, "runtime", id)}
 		for _, path := range []string{i.bundle, i.root} {
 			if err := os.MkdirAll(path, 0700); err != nil {
 				t.Fatal(err)
@@ -149,6 +178,17 @@ func (r *contextRuntime) Start(op, ctx context.Context, id, prepared, command st
 	return i, nil
 }
 
+func (r *fr) List() []Instance {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	var out []Instance
+	for _, i := range r.instances {
+		if !i.Exited() {
+			out = append(out, i)
+		}
+	}
+	return out
+}
 func (r *fr) Prepare(_ context.Context, id string, _ string, _ string, _ string, _ []string) (string, error) {
 	prepared := filepath.Join(r.data, "prepared", id)
 	if err := os.MkdirAll(filepath.Join(prepared, "rootfs", "app"), 0700); err != nil {
@@ -162,7 +202,7 @@ func (r *fr) Prepare(_ context.Context, id string, _ string, _ string, _ string,
 func (r *fr) ValidatePrepared(path string) error {
 	return (sandbox.Runtime{}).ValidatePrepared(path)
 }
-func (r *fr) Start(context.Context, context.Context, string, string, string, []string) (Instance, error) {
+func (r *fr) Start(_ context.Context, _ context.Context, id string, _ string, _ string, _ []string) (Instance, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.starts++
@@ -170,15 +210,15 @@ func (r *fr) Start(context.Context, context.Context, string, string, string, []s
 		r.failStarts--
 		return nil, errors.New("launch failed")
 	}
-	i := &fi{done: make(chan error), mem: r.memory}
+	i := &fi{id: id, done: make(chan error), mem: r.memory}
 	r.instances = append(r.instances, i)
 	return i, nil
 }
-func (r *fr) Restart(context.Context, string, string, string, []string) (Instance, error) {
+func (r *fr) Restart(_ context.Context, id string, _ string, _ string, _ []string) (Instance, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.restarts++
-	i := &fi{done: make(chan error), mem: r.memory}
+	i := &fi{id: id, done: make(chan error), mem: r.memory}
 	r.instances = append(r.instances, i)
 	return i, nil
 }

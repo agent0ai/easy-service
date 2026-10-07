@@ -20,7 +20,6 @@ services:
       RUNTIME_IMAGE: node:22-bookworm-slim
       SETUP_COMMAND: npm ci
       RUN_COMMAND: node server.js
-    security_opt: [seccomp=unconfined]
 ```
 
 For a private repository, set `GIT_TOKEN` in your shell or Portainer environment.
@@ -57,7 +56,9 @@ docker compose exec easy-service easy-service kill-draining
 docker compose logs -f easy-service
 ```
 
-- `status` shows the current revision, image, health state, and memory usage.
+- `status` shows the revision, image, health state, CPU and RAM for each instance.
+  It shows `not running` when no instance is active and `unavailable` if sampling
+  fails. Measurements include detached child processes. CPU is a sampled percentage; 100% means one fully used CPU core.
 - `redeploy` checks Git immediately and creates a fresh writable installation,
   even if the revision has not changed. It reuses the prepared dependencies.
 - `restart` restarts the current revision with its existing writable files.
@@ -125,6 +126,7 @@ The supervisor prints configuration changes, setup, startup, readiness, cutover,
 drain, exits, recovery and log collection to the console. Configuration events
 list variable names without printing their values. `status` also reports the
 short instance ID and whether configuration changes are pending.
+Runtime startup errors also appear in the console and retained instance logs.
 
 ## Additional settings
 
@@ -153,11 +155,15 @@ All of these are optional. Times are in seconds.
 Memory sizes accept bytes or `K`, `M`, `G`, and `T` suffixes (1024-based).
 Log sizes use the same suffixes. The file limit must be at least `1K`, and the
 total limit must be at least the file limit. Retention days must be positive.
-The memory threshold is checked about once per second and includes the sandbox
-process tree. It triggers a normal deployment rather than enforcing a hard cap.
+The memory threshold is checked about once per second and includes the whole
+instance, including detached children. It triggers a normal deployment rather than enforcing a hard cap.
+
+Container dashboards may include reclaimable file cache from copying images.
+`easy-service status` reports process RAM. The host kernel reclaims cache when
+memory is needed; Easy Service does not routinely flush it.
 
 `GIT_URL` can also be a local Git directory mounted into the container and
-readable by UID 10000. Only committed files are deployed; local repositories
+readable by the supervisor. Only committed files are deployed; local repositories
 support commit and tag updates.
 
 ## Logs and persistence
@@ -186,7 +192,7 @@ volumes:
 ```
 
 Declare those named volumes at the top level of the stack. Host bind directories
-must be writable by UID 10000. Directory locations are chosen through Docker's
+must be writable by root. Directory locations are chosen through Docker's
 `DATA_DIR`, `CONFIG_DIR` and `LOG_DIR` settings when the container starts;
 the other settings can be changed through the CLI.
 
@@ -206,17 +212,21 @@ Streaming uploads, streamed responses, SSE, and WebSockets are supported over
 HTTP/1.1. Use a trusted reverse proxy for HTTPS and client HTTP/2 or HTTP/3.
 Native HTTP/2 gRPC and forward-proxy CONNECT are unsupported.
 
-Use a Linux host with Docker 24+, kernel 5.15+ and unprivileged user namespaces.
-Keep the Compose security setting shown above so nested gVisor can start.
-Workloads run directly in rootless gVisor and share the outer container's
-network. Each instance gets its own port, including during updates; gVisor
-isolates its processes and filesystem. No TUN device or subordinate UID/GID
-setup is required. Startup fails if the host cannot provide gVisor.
+Use a Linux host with Docker 24+ and kernel 5.15+. Default Docker permissions
+are sufficient, including Hostinger's AppArmor and seccomp policies.
+
+The supervisor runs as root inside Docker. Each app instance runs as a separate
+unprivileged Linux user with a private writable filesystem. PRoot runs the
+unpacked OCI image without mounting filesystems or creating user namespaces.
+It shares Docker's network, devices and process information; Linux user and file
+permissions protect supervisor settings and other instances. This is process
+and file isolation, not a separate kernel sandbox. `DATA_DIR` parent directories
+must allow directory traversal. The default `/data` works as supplied.
 
 ## Development
 
 Run `make check` with Go 1.23+ and Python 3. The [DOX instructions](AGENTS.md)
-document each package's ownership and tests, including optional real OCI/gVisor
+document each package's ownership and tests, including optional real OCI/runtime
 and load checks.
 
 Pushing the highest version tag publishes `agent0ai/easy-service:<git-tag>` for

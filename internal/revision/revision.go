@@ -83,6 +83,11 @@ func (m *Manager) Prune() error {
 	return nil
 }
 func (m *Manager) run(ctx context.Context, dir string, args ...string) (string, error) {
+	// A persisted private mirror can outlive the supervisor's Linux identity.
+	// Trust precisely this owned cache, never other repositories or a wildcard.
+	if dir != "" && dir == m.Mirror {
+		args = append([]string{"-c", "safe.directory=" + m.Mirror}, args...)
+	}
 	c := process.Command(ctx, "git", args...)
 	c.Dir = dir
 	m.gitEnv(c)
@@ -113,15 +118,19 @@ func (m *Manager) Fetch(ctx context.Context) error {
 	}
 	args := []string{"fetch", "--prune", "--force"}
 	if filepath.IsAbs(m.URL) {
-		// Git strips command-scope configuration before starting upload-pack.
-		// Explicit local sources may be mounted from a different UID; pass
-		// exact trust to that helper, never to unrelated repositories.
-		quote := func(s string) string { return "'" + strings.ReplaceAll(s, "'", "'\\''") + "'" }
-		args = append(args, "--upload-pack=git -c "+quote("safe.directory="+m.URL)+" -c "+quote("safe.directory="+filepath.Join(m.URL, ".git"))+" upload-pack")
+		args = append(args, localUploadPack(m.URL))
 	}
 	args = append(args, "origin", "+refs/heads/*:refs/remotes/origin/*", "+refs/tags/*:refs/tags/*")
 	_, e := m.Run(ctx, m.Mirror, args...)
 	return e
+}
+
+func localUploadPack(repository string) string {
+	// Git strips command-scope configuration before starting upload-pack.
+	// Local sources and persisted mirrors can belong to a different UID;
+	// pass exact trust to this helper without global or wildcard trust.
+	quote := func(s string) string { return "'" + strings.ReplaceAll(s, "'", "'\\''") + "'" }
+	return "--upload-pack=git -c " + quote("safe.directory="+repository) + " -c " + quote("safe.directory="+filepath.Join(repository, ".git")) + " upload-pack"
 }
 func (m *Manager) Select(ctx context.Context, method, branch, pattern string) (Selection, error) {
 	op, cancel := context.WithTimeout(ctx, 2*time.Minute)
@@ -265,7 +274,7 @@ func (m *Manager) Checkout(ctx context.Context, sha, dst string) error {
 	if _, e := m.Run(op, dst, "init"); e != nil {
 		return e
 	}
-	if _, e := m.Run(op, dst, "fetch", "--depth=1", m.Mirror, sha); e != nil {
+	if _, e := m.Run(op, dst, "fetch", localUploadPack(m.Mirror), "--depth=1", m.Mirror, sha); e != nil {
 		return e
 	}
 	if _, e := m.Run(op, dst, "checkout", "--detach", sha); e != nil {

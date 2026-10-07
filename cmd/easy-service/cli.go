@@ -192,7 +192,15 @@ func cli(args []string, in io.Reader, out io.Writer) error {
 	if action != "status" {
 		report = fmt.Appendf(report, "%s completed\n", action)
 	}
-	report = fmt.Appendf(report, "State: %s\nRevision: %s\nImage: %s\nDigest: %s\nMemory: %.1f MiB\n", status.State, status.Revision, status.RuntimeImage, status.Digest, float64(status.MemoryBytes)/(1<<20))
+	report = fmt.Appendf(report, "State: %s\nRevision: %s\nImage: %s\nDigest: %s\n", status.State, status.Revision, status.RuntimeImage, status.Digest)
+	switch {
+	case status.Instance == "":
+		report = fmt.Appendf(report, "App memory: not running\n")
+	case status.ResourceError != "":
+		report = fmt.Appendf(report, "App memory: unavailable\n")
+	default:
+		report = fmt.Appendf(report, "App CPU: %.1f%%\nApp memory: %.1f MiB\n", status.CPUPercent, float64(status.MemoryBytes)/(1<<20))
+	}
 	if status.Instance != "" {
 		report = fmt.Appendf(report, "Instance: %s\n", status.Instance)
 	}
@@ -204,8 +212,18 @@ func cli(args []string, in io.Reader, out io.Writer) error {
 	} else {
 		report = fmt.Appendf(report, "Memory limit: disabled\n")
 	}
-	if status.MemoryError != "" {
-		report = fmt.Appendf(report, "Memory sample: %s\n", status.MemoryError)
+	if status.ResourceError != "" {
+		report = fmt.Appendf(report, "Resource sample: %s\n", status.ResourceError)
+	}
+	if len(status.Instances) > 1 || (status.Instance == "" && len(status.Instances) > 0) {
+		report = fmt.Appendf(report, "Instances:\n")
+		for _, i := range status.Instances {
+			if i.Error != "" {
+				report = fmt.Appendf(report, "  %s %s: resources unavailable (%s)\n", i.ID, i.State, i.Error)
+			} else {
+				report = fmt.Appendf(report, "  %s %s: CPU %.1f%%, RAM %.1f MiB\n", i.ID, i.State, i.CPUPercent, float64(i.MemoryBytes)/(1<<20))
+			}
+		}
 	}
 	_, err = out.Write(report)
 	return err

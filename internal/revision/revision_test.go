@@ -324,3 +324,29 @@ func TestLocalRepositoryForeignUIDHelper(t *testing.T) {
 		t.Fatal("checkout retained Git metadata")
 	}
 }
+
+func TestMirrorSurvivesSupervisorUIDChange(t *testing.T) {
+	if os.Geteuid() != 0 {
+		t.Skip("requires root to change cache ownership")
+	}
+	source := localRepository(t, "cache")
+	m := New(source, "", t.TempDir())
+	before, err := m.Select(context.Background(), "commit", "main", "*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chown(m.Mirror, 10000, 10000); err != nil {
+		t.Fatal(err)
+	}
+	after, err := m.Select(context.Background(), "commit", "main", "*")
+	if err != nil || before != after {
+		t.Fatalf("persisted mirror rejected after UID change: %v %v", after, err)
+	}
+	dst := filepath.Join(t.TempDir(), "checkout")
+	if err := m.Checkout(context.Background(), after.SHA, dst); err != nil {
+		t.Fatal("persisted mirror checkout rejected after UID change:", err)
+	}
+	if contents, err := os.ReadFile(filepath.Join(dst, "version")); err != nil || string(contents) != "cache" {
+		t.Fatalf("persisted mirror checkout: %q %v", contents, err)
+	}
+}

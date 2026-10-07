@@ -1,41 +1,39 @@
 # Purpose
 
-Own rootless gVisor isolation, private application filesystems and sandbox processes.
+Own OCI filesystem execution through PRoot, Linux user isolation and whole-instance lifetime.
 
 ## Ownership
 
-- `sandbox.go` owns prerequisite checks, OCI specs, preparation, start/restart, stop/kill, output wiring and process-tree RSS; retained files belong to `internal/logs`.
-- Recovery decisions belong to the supervisor engine; image unpack belongs to `internal/image`.
+- `sandbox.go` owns preparation, launch/restart, ports, DNS, output, CPU/RAM sampling and live-instance discovery.
+- `child.go` owns the internal launcher and guest re-exec boundary.
+- `internal/state` owns root-protected UID leases and restart reconciliation; `internal/process` owns UID process observation/signaling; retained files belong to `internal/logs`.
 
 ## Local Contracts
 
-- Require runsc and user namespaces; launch rootless systrap directly with directfs disabled and shared outer-container networking. Fail closed; require no TUN, subordinate UID/GID mappings or cgroup controller.
-- Never add host Docker-socket access or substitute runc/host execution in production.
-- Assign an available PORT on every setup, start and restart; the proxy endpoint must match it so overlapping revisions can serve concurrently. Applications must listen on PORT; no fixed SERVICE_PORT option remains.
-- Mount an owned read-only copy of the outer container's resolv.conf; OCI images may omit resolver configuration.
-- Copy disk-backed private rootfs trees and disable runsc's additional root overlay so setup/runtime writes persist in that owned tree; replace image `/app` before copying checkout content so host copies cannot follow its symlink.
-- Bind /tmp to its private disk-backed rootfs directory, replacing image symlinks before host access. An explicit bind prevents runsc's automatic tmpfs over an empty /tmp; setup files survive launch and restart without a fixed temporary-storage cap. HOME also stays in the private filesystem.
-- Setup uses SETUP_TIMEOUT (fifteen minutes by default) and stops before failed preparation is removed.
-- Separate filesystem-operation cancellation from running sandbox lifetime.
-- `Done` is a closed broadcast immediately after process/output completion, before console reporting or file-writer retirement can block. Repeated `Wait` calls preserve the exit result.
-- Capture registered instance stdout/stderr through the shared log owner, while retaining console prefixes. Release file handles without deleting retained pages or registrations for a later phase.
-- Explicit Kill sends SIGKILL only to the live instance's owned process group and waits for reaping; never signal a completed instance. The engine determines retirement ownership.
-- Do not signal completed instances. Stop escalates from TERM to KILL when its grace context expires and waits up to two additional seconds for process/output completion before reporting success.
-- Merge default PATH/HOME, immutable image environment and explicit application values in that order; reserve only the assigned PORT. HOME defaults to /root. Never inherit supervisor credentials/environment into the workload.
-- RSS is a soft observation of the active owned process tree, including children from all threads; memory replacement policy stays in the engine.
+- Run the supervisor as root inside Docker; execute each setup/run as a separate leased UID with cleared groups and no_new_privs. Use PRoot 5.5 without nested mounts, user namespaces, host policy changes or a Docker socket.
+- PRoot supplies OCI path translation and apparent root; Linux UIDs/file permissions supply containment. Workloads share the outer network, devices and process information rather than a separate kernel sandbox.
+- Keep OCI image and Git caches, configuration, control and logs inaccessible to workload users. Never inherit the supervisor environment. The inherited launch descriptor carries only app settings; close it before running the app.
+- Preserve image environment and explicit APP_* values, reserving only assigned PORT; default HOME is /root. Keep tracer environment separate from the guest environment.
+- Assign an available PORT for every setup/start/restart; endpoints must match it so overlapping instances can serve concurrently.
+- Copy private writable rootfs trees, replace image /app and /tmp symlinks before host access, retain HOME/tmp setup writes, and never follow image symlinks during recursive ownership changes.
+- DATA_DIR and managed instance parents permit traversal; rootfs and tracer temporary storage belong only to the leased UID. Root-owned launch settings stay private. Custom DATA_DIR ancestors must permit directory traversal.
+- Supply an owned read-only resolver copy using PRoot path translation; guest resolver symlinks cannot redirect host writes.
+- Setup honors SETUP_TIMEOUT and confirms termination before failed preparation is removed. Never reuse or validate a prepared filesystem still owned by live setup. Filesystem cancellation remains separate from app lifetime.
+- Stop signals every process owned by the leased UID, including detached/reparented descendants, then escalates to KILL at the deadline. Cancellation also stops the whole UID; signal the UID before terminating the tracer. Confirm all live UID processes exited before release, Done or filesystem cleanup. Never reuse a live UID or signal completed instances.
+- Close Done as a broadcast after process/output/descendant completion and before console reporting or file-writer retirement can block; preserve exit errors across repeated Wait calls.
+- Capture registered stdout/stderr and runtime failures through the shared log owner; release file handles without deleting retained logs.
+- Report sampled CPU and soft resident memory across the complete UID, including detached descendants. CPU 100% means one core. Memory replacement policy remains in the serialized engine.
+- Live discovery covers setup, candidates, running and draining instances; remove completed instances from the process-local registry.
 
 ## Work Guidance
 
-- Process/filesystem fakes must preserve lifecycle and isolation contract arguments.
-- Do not broaden process scanning in the approximately one-second memory sampler.
+- Owned execution fakes must preserve credential dropping, no_new_privs, workload environment exclusion, exit broadcasts and complete UID cleanup.
+- Qualify actual OCI/PRoot execution on the remote host under default security policies before relying on it.
 
 ## Verification
 
-- `go test -race ./internal/sandbox`.
-- `TestWorkloadEnvironmentPrecedenceAndIsolation` checks image defaults, APP_* overrides, reserved PORT and supervisor environment exclusion.
-- `TestDirectRuntimeUsesDistinctPortsAndDockerDNS` exercises production allocation/spec/DNS with overlapping HTTP helper processes replacing only runsc execution.
-- `go test ./internal/sandbox -run '^$' -bench . -benchmem` measures RSS sampling.
-- Real gVisor startup requires the host prerequisites in `../../README.md`; passing fakes does not prove host isolation works.
+- `go test -race ./internal/sandbox` checks overlapping ports/UIDs, private file ownership, privilege restrictions, detached-child CPU/RAM, whole-instance kill, peer survival and retained failure output.
+- Actual OCI/PRoot checks belong to cmd/easy-service/real_test.go; fakes do not verify OCI syscall compatibility.
 
 ## Child DOX Index
 

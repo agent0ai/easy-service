@@ -4,7 +4,7 @@ Own lightweight repository contract checks.
 
 ## Ownership
 
-- `contract-test.sh` checks README/configuration, Compose defaults, optional volume persistence and absence of Docker-socket or RootlessKit/slirp/TUN/UID-map dependencies.
+- `contract-test.sh` checks README/configuration, Compose defaults, optional volume persistence and default Docker security policies and absence of Docker-socket, gVisor, privileged/device/capability or RootlessKit/slirp/TUN/UID-map dependencies.
 - The root Makefile runs the script after Go formatting, vet and race tests.
 
 ## Local Contracts

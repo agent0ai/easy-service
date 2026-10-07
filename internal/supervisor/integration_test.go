@@ -17,6 +17,7 @@ import (
 
 	"github.com/example/easy-service/internal/config"
 	"github.com/example/easy-service/internal/health"
+	"github.com/example/easy-service/internal/process"
 	"github.com/example/easy-service/internal/proxy"
 	"github.com/example/easy-service/internal/revision"
 	"github.com/example/easy-service/internal/sandbox"
@@ -29,6 +30,7 @@ type httpRuntime struct {
 	sandbox.Runtime
 	mu               sync.Mutex
 	starts, restarts int
+	instances        []*httpInstance
 }
 
 type httpInstance struct {
@@ -39,6 +41,8 @@ type httpInstance struct {
 	cancel       context.CancelFunc
 }
 
+func (i *httpInstance) Identity() string { return filepath.Base(i.root) }
+
 func (i *httpInstance) Exited() bool {
 	select {
 	case <-i.done:
@@ -47,11 +51,11 @@ func (i *httpInstance) Exited() bool {
 		return false
 	}
 }
-func (i *httpInstance) Done() <-chan error           { return i.done }
-func (i *httpInstance) Endpoint() string             { return i.server.URL }
-func (i *httpInstance) BundlePath() string           { return i.bundle }
-func (i *httpInstance) RootPath() string             { return i.root }
-func (i *httpInstance) MemoryUsage() (uint64, error) { return 0, nil }
+func (i *httpInstance) Done() <-chan error            { return i.done }
+func (i *httpInstance) Endpoint() string              { return i.server.URL }
+func (i *httpInstance) BundlePath() string            { return i.bundle }
+func (i *httpInstance) RootPath() string              { return i.root }
+func (i *httpInstance) Usage() (process.Usage, error) { return process.Usage{}, nil }
 func (i *httpInstance) Stop(context.Context) error {
 	i.once.Do(func() {
 		i.cancel()
@@ -62,6 +66,17 @@ func (i *httpInstance) Stop(context.Context) error {
 	return nil
 }
 func (i *httpInstance) Kill(ctx context.Context) error { return i.Stop(ctx) }
+func (r *httpRuntime) List() []Instance {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	var out []Instance
+	for _, i := range r.instances {
+		if !i.Exited() {
+			out = append(out, i)
+		}
+	}
+	return out
+}
 func (r *httpRuntime) Start(op, lifetime context.Context, id, prepared, _ string, _ []string) (Instance, error) {
 	bundle := filepath.Join(r.Data, "instances", id)
 	if err := sandbox.CopyTree(op, filepath.Join(prepared, "rootfs"), filepath.Join(bundle, "rootfs")); err != nil {
@@ -86,7 +101,7 @@ func (r *httpRuntime) launch(lifetime context.Context, id, bundle string) (Insta
 	}
 	version := string(b)
 	ctx, cancel := context.WithCancel(lifetime)
-	i := &httpInstance{bundle: bundle, root: filepath.Join(r.Data, "runsc-root", id), done: make(chan error), cancel: cancel}
+	i := &httpInstance{bundle: bundle, root: filepath.Join(r.Data, "runtime", id), done: make(chan error), cancel: cancel}
 	i.server = httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 		if req.URL.Path == "/health" {
 			switch version {
@@ -109,6 +124,9 @@ func (r *httpRuntime) launch(lifetime context.Context, id, bundle string) (Insta
 	}))
 	i.server.Config.BaseContext = func(net.Listener) context.Context { return ctx }
 	i.server.Start()
+	r.mu.Lock()
+	r.instances = append(r.instances, i)
+	r.mu.Unlock()
 	go func() {
 		select {
 		case <-ctx.Done():

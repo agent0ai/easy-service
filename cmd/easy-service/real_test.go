@@ -27,22 +27,22 @@ import (
 	"github.com/example/easy-service/internal/supervisor"
 )
 
-var realGVisor = flag.Bool("real-gvisor", false, "test the real rootless gVisor/OCI/Git/HTTP lifecycle as an unprivileged user")
+var realRuntime = flag.Bool("real-runtime", false, "test the real PRoot/Linux UID/OCI/Git/HTTP lifecycle as an unprivileged user")
 
 func TestRealConfigurationCLIAndRestart(t *testing.T) {
-	if !*realGVisor {
-		t.Skip("enable on a supported host with -real-gvisor")
+	if !*realRuntime {
+		t.Skip("enable on a supported host with -real-runtime")
 	}
 	binary := os.Getenv("EASY_SERVICE_REAL_BINARY")
 	if binary == "" {
 		t.Skip("set EASY_SERVICE_REAL_BINARY to the built supervisor (able to bind port 80)")
 	}
-	if os.Geteuid() == 0 {
-		t.Fatal("run as an unprivileged user")
+	if os.Geteuid() != 0 {
+		t.Fatal("run as root")
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
 	defer cancel()
-	root := t.TempDir()
+	root := realDirectory(t)
 	data, cfgDir, logDir := filepath.Join(root, "data"), filepath.Join(root, "config"), filepath.Join(root, "logs")
 	env := []string{"PATH=" + os.Getenv("PATH"), "DATA_DIR=" + data, "CONFIG_DIR=" + cfgDir, "LOG_DIR=" + logDir, "SUPERVISOR_ONLY_TEST=must-stay-outside"}
 	consolePath := filepath.Join(root, "console")
@@ -95,7 +95,8 @@ func TestRealConfigurationCLIAndRestart(t *testing.T) {
 		cmd.Env = env
 		b, err := cmd.CombinedOutput()
 		if err != nil {
-			t.Fatalf("CLI %v: %v %s", args, err, b)
+			consoleOutput, _ := os.ReadFile(consolePath)
+			t.Fatalf("CLI %v: %v %s\n%s", args, err, b, consoleOutput)
 		}
 		return string(b)
 	}
@@ -122,8 +123,8 @@ func TestRealConfigurationCLIAndRestart(t *testing.T) {
 	}
 	start()
 	wait(func() bool { _, err := os.Stat(supervisor.ControlPath(data)); return err == nil })
-	if !strings.Contains(cli("status"), "State: waiting") {
-		t.Fatal("empty container did not wait for CLI configuration")
+	if status := cli("status"); !strings.Contains(status, "State: waiting") || !strings.Contains(status, "App memory: not running") {
+		t.Fatalf("empty container status: %s", status)
 	}
 	origin := t.TempDir()
 	git := revision.New(origin, "", data)
@@ -164,6 +165,9 @@ func TestRealConfigurationCLIAndRestart(t *testing.T) {
 	}
 	if !strings.Contains(joined, "stdout one") || !strings.Contains(joined, "stderr one") || !strings.Contains(joined, "commit: \""+sha+"\"") || !strings.HasPrefix(joined, "---\n") {
 		t.Fatalf("missing output/frontmatter: %s", joined)
+	}
+	if strings.Contains(joined, "must-stay-outside") {
+		t.Fatal("supervisor environment exposed in retained logs")
 	}
 	cli("config", "set", "APP_MESSAGE=two")
 	if !served("one") {
@@ -265,19 +269,19 @@ func TestRealConfigurationCLIAndRestart(t *testing.T) {
 	}
 }
 
-func TestRealGVisorLifecycle(t *testing.T) {
-	if !*realGVisor {
-		t.Skip("enable with -args -real-gvisor on a supported host")
+func TestRealRuntimeLifecycle(t *testing.T) {
+	if !*realRuntime {
+		t.Skip("enable with -args -real-runtime on a supported host")
 	}
-	if os.Geteuid() == 0 {
-		t.Fatal("run the real rootless lifecycle test as an unprivileged user")
+	if os.Geteuid() != 0 {
+		t.Fatal("run the real runtime lifecycle test as root")
 	}
 	if err := sandbox.Validate(); err != nil {
 		t.Fatal(err)
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
 	t.Cleanup(cancel)
-	data, origin := t.TempDir(), t.TempDir()
+	data, origin := realDirectory(t), t.TempDir()
 	git := revision.New(origin, "", data)
 	runGit := func(args ...string) string {
 		t.Helper()
@@ -336,8 +340,8 @@ func TestRealGVisorLifecycle(t *testing.T) {
 	}
 	assertServed("one")
 	status := e.Status()
-	if status.MemoryError != "" || status.MemoryBytes == 0 {
-		t.Fatalf("direct runsc memory sample: bytes=%d error=%s", status.MemoryBytes, status.MemoryError)
+	if status.ResourceError != "" || status.MemoryBytes == 0 {
+		t.Fatalf("native runtime memory sample: bytes=%d error=%s", status.MemoryBytes, status.ResourceError)
 	}
 	if err := e.Deploy(ctx, commit("bad")); err == nil {
 		t.Fatal("broken real sandbox candidate was accepted")
@@ -348,27 +352,27 @@ func TestRealGVisorLifecycle(t *testing.T) {
 	}
 	assertServed("two")
 	if err := e.Store.Reconcile(); err != nil {
-		t.Fatalf("direct runsc orphan reconciliation: %v", err)
+		t.Fatalf("native runtime orphan reconciliation: %v", err)
 	}
 	res, err := front.Client().Get(front.URL + "/index.html")
 	if err == nil {
 		_ = res.Body.Close()
 		if res.StatusCode == 200 {
-			t.Fatal("reconciliation left the direct runsc workload serving")
+			t.Fatal("reconciliation left the native runtime workload serving")
 		}
 	}
 }
 
 func TestRealGoImageEnvironmentAndSetup(t *testing.T) {
-	if !*realGVisor {
-		t.Skip("enable with -args -real-gvisor on a supported host")
+	if !*realRuntime {
+		t.Skip("enable with -args -real-runtime on a supported host")
 	}
-	if os.Geteuid() == 0 {
-		t.Fatal("run the real rootless lifecycle test as an unprivileged user")
+	if os.Geteuid() != 0 {
+		t.Fatal("run the real runtime lifecycle test as root")
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
-	images := imagepkg.Manager{Data: t.TempDir(), Runner: process.Runner{}}
+	images := imagepkg.Manager{Data: realDirectory(t), Runner: process.Runner{}}
 	image, err := images.Prepare(ctx, "golang:1.27.1-bookworm")
 	if err != nil {
 		t.Fatal(err)
@@ -422,4 +426,25 @@ func main() {
 	if err != nil || string(body) != "go-ready" {
 		t.Fatalf("real Go service response: %q %v", body, err)
 	}
+}
+
+func TestMain(m *testing.M) {
+	if handled, err := sandbox.Child(os.Args[1:]); handled {
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		return
+	}
+	os.Exit(m.Run())
+}
+func realDirectory(t *testing.T) string {
+	t.Helper()
+	dir := t.TempDir()
+	for p := dir; strings.HasPrefix(p, "/tmp/"); p = filepath.Dir(p) {
+		if err := os.Chmod(p, 0711); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return dir
 }

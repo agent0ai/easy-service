@@ -84,7 +84,9 @@ Default section order:
 - Runtime configuration uses staged `config set`/`unset`, full or filtered `config show`, and explicit `config apply`; Docker environment values are defaults beneath durable overrides.
 - Retain instance stdout/stderr independently of sandbox cleanup, in daily paginated logs with configurable age, file and total size limits. Keep config, logs and caches in separate folders without mandatory volume mappings.
 - Keep README.md simple: lead with the five basic launch settings, show the container CLI, then list optional settings.
-- Launch gVisor directly as 8020 does, sharing the outer container's network with an automatically assigned PORT per instance; do not add RootlessKit/slirp4netns, TUN access or subordinate UID/GID setup.
+- Work under default Hostinger/Docker permissions without host policy changes, extra capabilities, devices or a Docker socket. Use PRoot with dedicated unprivileged Linux users for OCI filesystems and whole-instance ownership; assign PORT automatically.
+- Qualify remote changes with uploaded binaries and Docker exec; do not make commits, pushes or image builds for experiments.
+- Leave reclaimable file cache to the host kernel; report process RAM accurately and do not add routine cache trimming just to lower container dashboard numbers.
 
 ## Child DOX Index
 
@@ -97,11 +99,12 @@ The root owns README.md, Dockerfile, compose.yaml, Makefile, go.mod, .gitignore 
 
 ## Project Context and Verification
 
-- easy-service supervises stateless HTTP workloads selected from Git, installed in rootless gVisor sandboxes and exposed on port 80.
+- easy-service supervises stateless HTTP workloads selected from Git, installed in private OCI filesystems and exposed on port 80.
 - README.md is the public configuration, deployment and lifecycle reference. Keep it aligned with implementation.
 - Run `make check` with Go 1.23 or later and Python 3: formatting, vet, race tests, `scripts/contract-test.sh` and Docker publication policy tests.
-- Cross-package tests may fake owned external boundaries; real OCI/gVisor and Docker build checks require their documented tools and host prerequisites.
-- Docker runtime packaging retains runsc and its companion helpers while excluding the unused containerd shim; this service launches runsc directly.
+- Cross-package tests may fake owned external boundaries; real OCI/runtime and Docker build checks require their documented tools and host prerequisites.
+- Compose uses Docker's default security policies. The supervisor runs as root inside Docker and drops each workload to a unique Linux UID with no_new_privs; PRoot 5.5 translates OCI paths without nested mounts or namespaces.
+- Docker packages the pinned, checksum-verified PRoot source for both amd64 and arm64; older Debian PRoot versions do not support modern filesystem calls.
 - The same Docker binary starts the supervisor without arguments and provides `status`, `redeploy`, `restart`, `kill-draining`, `config` and `help` subcommands. Control stays on a private Unix socket under DATA_DIR.
 - Runtime images default to `debian:bookworm-slim`; use Skopeo's native Docker image-name handling for shorthand names.
 - Preserve image environment defaults and explicit APP_* overrides, reserving only PORT; HOME defaults to /root. Setup writes in HOME and /tmp stay on the private writable filesystem.
@@ -124,13 +127,13 @@ The root owns README.md, Dockerfile, compose.yaml, Makefile, go.mod, .gitignore 
 
 Trace defects through the complete revision-selection, preparation, sandbox,
 health, routing, drain, and recovery flow. Fix behavior in the subsystem that
-owns its contract; callers may not weaken gVisor isolation, duplicate recovery
+owns its contract; callers may not weaken workload user/file isolation, duplicate recovery
 policy, or leak supervisor credentials/environment into workloads. Keep the
 public environment-variable surface exactly aligned with README.md and
 internal/config. Production code must not add a host Docker-socket dependency.
 
 Memory pressure is an approximately one-second soft observation of the active
-runsc process tree. It must enter the serialized deployment engine
+instance UID, including detached descendants. It must enter the serialized deployment engine
 as a same-revision blue/green replacement request; it may not create a second
 cutover, readiness, drain, or recovery state machine.
 

@@ -1,26 +1,133 @@
 package sandbox
 
 import (
-	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
+	"github.com/example/easy-service/internal/health"
+	"github.com/example/easy-service/internal/logs"
+	"github.com/example/easy-service/internal/process"
 	"io"
-	"net"
 	"net/http"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
-	"runtime"
 	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
-
-	"github.com/example/easy-service/internal/health"
-	"github.com/example/easy-service/internal/process"
 )
 
+var heldMemory []byte
+
+func TestMain(m *testing.M) {
+	if len(os.Args) > 1 && os.Args[1] == "__fake-runtime" {
+		fakeRuntime()
+		return
+	}
+	if len(os.Args) > 1 && os.Args[1] == "__daemon" {
+		signal.Ignore(syscall.SIGTERM)
+		heldMemory = make([]byte, 64<<20)
+		for i := range heldMemory {
+			heldMemory[i] = 1
+		}
+		for {
+			for i := range heldMemory {
+				heldMemory[i]++
+			}
+		}
+	}
+	if handled, err := Child(os.Args[1:]); handled {
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		return
+	}
+	os.Exit(m.Run())
+}
+func fakeRuntime() {
+	var config launchConfig
+	if err := json.NewDecoder(os.NewFile(3, "configuration")).Decode(&config); err != nil {
+		panic(err)
+	}
+	if os.Geteuid() != int(config.UID) {
+		panic("real UID was not changed")
+	}
+	status, _ := os.ReadFile("/proc/self/status")
+	if !strings.Contains(string(status), "NoNewPrivs:\t1") {
+		panic("privilege escalation was not disabled")
+	}
+	if os.Getenv("SUPERVISOR_ONLY_TEST") != "" {
+		panic("supervisor environment leaked")
+	}
+	if config.Command == "fail" {
+		fmt.Fprintln(os.Stdout, "setup-output")
+		fmt.Fprintln(os.Stderr, "runtime-start-failure")
+		os.Exit(23)
+	}
+	if config.Command == "ignore-term" {
+		signal.Ignore(syscall.SIGTERM)
+	}
+	values := map[string]string{}
+	for _, line := range config.Env {
+		key, value, _ := strings.Cut(line, "=")
+		values[key] = value
+	}
+	handler := http.NewServeMux()
+	handler.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) { fmt.Fprint(w, values["MESSAGE"]) })
+	handler.HandleFunc("/spawn", func(w http.ResponseWriter, r *http.Request) {
+		cmd := exec.Command(os.Args[0], "__daemon")
+		cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
+		if err := cmd.Start(); err != nil {
+			http.Error(w, err.Error(), 500)
+			return
+		}
+		go cmd.Wait()
+		fmt.Fprint(w, cmd.Process.Pid)
+	})
+	if err := http.ListenAndServe("127.0.0.1:"+values["PORT"], handler); err != nil {
+		panic(err)
+	}
+}
+func fakeNative(t *testing.T) Runtime {
+	t.Helper()
+	if os.Geteuid() != 0 {
+		t.Skip("Linux UID isolation requires root")
+	}
+	root := t.TempDir()
+	for p := root; strings.HasPrefix(p, "/tmp/"); p = filepath.Dir(p) {
+		if err := os.Chmod(p, 0711); err != nil {
+			t.Fatal(err)
+		}
+	}
+	bin := filepath.Join(root, "bin")
+	if err := os.Mkdir(bin, 0755); err != nil {
+		t.Fatal(err)
+	}
+	source, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	copy := filepath.Join(bin, "helper")
+	bytes, err := os.ReadFile(source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(copy, bytes, 0755); err != nil {
+		t.Fatal(err)
+	}
+	script := "#!/bin/sh\nexec '" + strings.ReplaceAll(copy, "'", "'\"'\"'") + "' __fake-runtime\n"
+	if err := os.WriteFile(filepath.Join(bin, "proot"), []byte(script), 0755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin+":"+os.Getenv("PATH"))
+	t.Setenv("SUPERVISOR_ONLY_TEST", "must-stay-outside")
+	return Runtime{Data: filepath.Join(root, "data")}
+}
 func TestPrivateWritableCopies(t *testing.T) {
 	base := t.TempDir()
 	os.WriteFile(filepath.Join(base, "x"), []byte("base"), 0600)
@@ -61,13 +168,6 @@ func TestWorkloadEnvironmentPrecedenceAndIsolation(t *testing.T) {
 	}
 }
 
-func TestMissingIsolationPrerequisitesFailClosed(t *testing.T) {
-	t.Setenv("PATH", t.TempDir())
-	if e := Validate(); e == nil || !strings.Contains(e.Error(), "mandatory rootless gVisor prerequisite") {
-		t.Fatalf("unexpected validation result: %v", e)
-	}
-}
-
 func TestPreparedValidationRequiresCompleteInstallation(t *testing.T) {
 	d := t.TempDir()
 	if err := os.WriteFile(filepath.Join(d, ".easy-service-ready"), []byte("ok"), 0600); err != nil {
@@ -81,16 +181,6 @@ func TestPreparedValidationRequiresCompleteInstallation(t *testing.T) {
 	}
 	if err := (Runtime{}).ValidatePrepared(d); err != nil {
 		t.Fatalf("complete prepared installation rejected: %v", err)
-	}
-}
-
-func TestProcessTreeMemorySampling(t *testing.T) {
-	used, err := processTreeRSS(os.Getpid())
-	if err != nil {
-		t.Fatal(err)
-	}
-	if used == 0 {
-		t.Fatal("running process tree reported no resident memory")
 	}
 }
 
@@ -115,297 +205,179 @@ func TestImageAppSymlinkCannotEscapePreparation(t *testing.T) {
 	}
 }
 
-func BenchmarkProcessTreeMemorySampling(b *testing.B) {
-	b.ReportAllocs()
-	for i := 0; i < b.N; i++ {
-		if _, err := processTreeRSS(os.Getpid()); err != nil {
-			b.Fatal(err)
-		}
+func TestMissingRuntimePrerequisitesFailClosed(t *testing.T) {
+	t.Setenv("PATH", t.TempDir())
+	if err := Validate(); err == nil {
+		t.Fatal("missing runtime accepted")
 	}
 }
 
-func TestExitObservationPreservesWaitError(t *testing.T) {
-	bin := t.TempDir()
-	if err := os.WriteFile(filepath.Join(bin, "runsc"), []byte("#!/bin/sh\nexit 23\n"), 0700); err != nil {
+func TestLiveSetupFilesystemCannotBeReusedOrRemoved(t *testing.T) {
+	r := fakeNative(t)
+	bundle := filepath.Join(r.Data, "prepared", "busy")
+	if err := os.MkdirAll(filepath.Join(bundle, "rootfs", "app"), 0700); err != nil {
 		t.Fatal(err)
 	}
-	t.Setenv("PATH", bin+":"+os.Getenv("PATH"))
-	r := Runtime{Data: t.TempDir()}
-	i, err := r.start(context.Background(), "failed", t.TempDir(), "ignored", nil)
+	marker := filepath.Join(bundle, ".easy-service-ready")
+	if err := os.WriteFile(marker, []byte("ok\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	i, err := r.start(context.Background(), "setup-busy", bundle, "ignore-term", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	<-i.Done()
-	if !i.Exited() {
-		t.Fatal("finished process was not reported exited")
-	}
-	for n := 0; n < 3; n++ {
-		if err := i.Wait(context.Background()); err == nil {
-			t.Fatal("exit observation consumed the setup failure")
-		}
-	}
-}
-
-func TestForcedStopReapsBeforeReturning(t *testing.T) {
-	bin, ready := t.TempDir(), filepath.Join(t.TempDir(), "ready")
-	helper := "#!/bin/sh\ntrap '' TERM\n: > \"$EASY_SERVICE_STOP_READY\"\nwhile :; do sleep 1; done\n"
-	if err := os.WriteFile(filepath.Join(bin, "runsc"), []byte(helper), 0700); err != nil {
-		t.Fatal(err)
-	}
-	t.Setenv("PATH", bin+":"+os.Getenv("PATH"))
-	t.Setenv("EASY_SERVICE_STOP_READY", ready)
-	i, err := (Runtime{Data: t.TempDir()}).start(context.Background(), "ignore-term", t.TempDir(), "ignored", nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() {
-		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 		defer cancel()
-		_ = i.Stop(ctx)
-	})
-	deadline := time.Now().Add(time.Second)
+		if err := i.Kill(ctx); err != nil {
+			t.Error(err)
+		}
+	}()
+	if err := r.ValidatePrepared(bundle); err == nil {
+		t.Fatal("accepted a filesystem still owned by live setup")
+	}
+	if _, err := r.Prepare(context.Background(), "busy", "", "", "", nil); err == nil {
+		t.Fatal("reused a live setup filesystem")
+	}
+	if _, err := os.Stat(marker); err != nil {
+		t.Fatal("removed a live setup filesystem:", err)
+	}
+}
+func TestNativeRuntimeOwnsAllProcessesAndFiles(t *testing.T) {
+	r := fakeNative(t)
+	var instances []*Instance
+	for _, id := range []string{"old", "candidate"} {
+		bundle := filepath.Join(r.Data, "instances", id)
+		if err := os.MkdirAll(filepath.Join(bundle, "rootfs", "app"), 0700); err != nil {
+			t.Fatal(err)
+		}
+		i, err := r.start(context.Background(), id, bundle, "ignore-term", []string{"MESSAGE=" + id, "PORT=wrong"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		instances = append(instances, i)
+		t.Cleanup(func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			defer cancel()
+			_ = i.Kill(ctx)
+		})
+		if err := health.New(time.Millisecond, "/").Ready(context.Background(), i.Endpoint(), i, 5*time.Second); err != nil {
+			t.Fatal(err)
+		}
+		st, err := os.Stat(filepath.Join(bundle, "rootfs"))
+		if err != nil || st.Sys().(*syscall.Stat_t).Uid != i.owner.UID || st.Mode().Perm() != 0700 {
+			t.Fatalf("private filesystem owner: %v %v", st, err)
+		}
+		dns, err := os.ReadFile(filepath.Join(i.Root, "resolv.conf"))
+		expected, _ := os.ReadFile("/etc/resolv.conf")
+		if err != nil || string(dns) != string(expected) {
+			t.Fatal("Docker DNS was not copied")
+		}
+	}
+	old, candidate := instances[0], instances[1]
+	if old.Port == candidate.Port || old.owner.UID == candidate.owner.UID || len(r.List()) != 2 {
+		t.Fatal("overlapping instances share identity")
+	}
+	response, err := http.Get(old.Endpoint() + "/spawn")
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := io.ReadAll(response.Body)
+	response.Body.Close()
+	pid, err := strconv.Atoi(string(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(5 * time.Second)
 	for {
-		if _, err := os.Stat(ready); err == nil {
+		usage, err := old.Usage()
+		if err == nil && usage.MemoryBytes >= 64<<20 && usage.CPUPercent > 0 {
 			break
 		}
 		if time.Now().After(deadline) {
-			t.Fatal("helper did not start")
+			t.Fatalf("CPU/RAM not observed: %+v %v", usage, err)
 		}
-		time.Sleep(time.Millisecond)
+		time.Sleep(220 * time.Millisecond)
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
+	stat, err := os.ReadFile(fmt.Sprintf("/proc/%d/stat", pid))
+	if err != nil {
+		t.Fatal(err)
+	}
+	fields := strings.Fields(string(stat)[strings.LastIndexByte(string(stat), ')')+1:])
+	if fields[2] != strconv.Itoa(pid) {
+		t.Fatal("worker did not leave the parent's group")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
 	defer cancel()
-	_ = i.Stop(ctx)
-	if !i.Exited() {
-		t.Fatal("forced stop returned before process-group completion")
+	if err := old.Stop(ctx); err != nil || !old.Exited() {
+		t.Fatalf("whole-instance forced stop: %v", err)
+	}
+	sample, err := process.SampleUser(old.owner.UID)
+	if err != nil || len(sample.PIDs) != 0 {
+		t.Fatal("detached descendants survived", sample, err)
+	}
+	if err := old.Kill(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	response, err = http.Get(candidate.Endpoint())
+	if err != nil {
+		t.Fatal("peer instance stopped", err)
+	}
+	body, _ = io.ReadAll(response.Body)
+	response.Body.Close()
+	if string(body) != "candidate" {
+		t.Fatal("wrong peer response")
 	}
 }
-
+func TestRuntimeFailurePreservesOutputAndWaitResult(t *testing.T) {
+	r := fakeNative(t)
+	var stdout, stderr bytes.Buffer
+	r.Stdout, r.Stderr = &stdout, &stderr
+	directory := t.TempDir()
+	manager, err := logs.New(directory, logs.Policy{Days: 30, FileSize: 10 << 20, TotalSize: 1 << 30})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer manager.Close()
+	r.Logs = manager
+	manager.Register("setup-abcdef123456", logs.Info{ID: "abcdef123456", Commit: "fixture", DeployedAt: time.Now()})
+	bundle := filepath.Join(r.Data, "prepared", "fixture")
+	i, err := r.start(context.Background(), "setup-abcdef123456", bundle, "fail", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for n := 0; n < 3; n++ {
+		err := i.Wait(context.Background())
+		if exit, ok := err.(*exec.ExitError); !ok || exit.ExitCode() != 23 {
+			t.Fatalf("wait consumed error: %v", err)
+		}
+	}
+	entries, err := os.ReadDir(directory)
+	if err != nil || len(entries) != 1 {
+		t.Fatalf("logs missing: %v %v", entries, err)
+	}
+	retained, err := os.ReadFile(filepath.Join(directory, entries[0].Name()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, message := range []string{"setup-output", "runtime-start-failure"} {
+		if !strings.Contains(stdout.String()+stderr.String(), message) || !strings.Contains(string(retained), message) {
+			t.Fatal("console/retained output lost", message)
+		}
+	}
+}
 func TestExitedInstanceDoesNotSignalStalePID(t *testing.T) {
 	cmd := process.Command(context.Background(), "sleep", "10")
 	if err := cmd.Start(); err != nil {
 		t.Fatal(err)
 	}
-	done := make(chan struct{})
-	go func() { _ = process.Wait(cmd); close(done) }()
-	t.Cleanup(func() { _ = process.KillGroup(cmd); <-done })
-	// Model a completed instance whose PID was reused by an unrelated group.
+	defer func() { _ = cmd.Process.Kill(); _ = cmd.Wait() }()
 	i := &Instance{cmd: cmd, done: make(chan error)}
 	close(i.done)
 	if err := i.Stop(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	select {
-	case <-done:
-		t.Fatal("an exited instance signalled the reused process group")
-	case <-time.After(10 * time.Millisecond):
+	if err := cmd.Process.Signal(syscall.Signal(0)); err != nil {
+		t.Fatal("completed instance signalled another process")
 	}
-}
-
-func TestDirectRuntimeUsesDistinctPortsAndDockerDNS(t *testing.T) {
-	bin := t.TempDir()
-	executable, err := os.Executable()
-	if err != nil {
-		t.Fatal(err)
-	}
-	// Only runsc execution is replaced; allocation, OCI spec, DNS and HTTP are real.
-	helper := "#!/bin/sh\nexec \"$EASY_SERVICE_RUNSC_BINARY\" -test.run=^TestDirectRunscHelper$ -- \"$@\"\n"
-	if err := os.WriteFile(filepath.Join(bin, "runsc"), []byte(helper), 0700); err != nil {
-		t.Fatal(err)
-	}
-	t.Setenv("PATH", bin+":"+os.Getenv("PATH"))
-	t.Setenv("EASY_SERVICE_RUNSC_BINARY", executable)
-	t.Setenv("EASY_SERVICE_RUNSC_HELPER", "1")
-	r := Runtime{Data: t.TempDir()}
-	resolver, err := os.ReadFile("/etc/resolv.conf")
-	if err != nil {
-		t.Fatal(err)
-	}
-	ports := make(map[int]bool)
-	for _, id := range []string{"old", "candidate"} {
-		bundle := filepath.Join(r.Data, "instances", id)
-		if id == "old" {
-			// An image's absolute /tmp symlink must not become a host bind source.
-			if err := os.MkdirAll(filepath.Join(bundle, "rootfs"), 0700); err != nil {
-				t.Fatal(err)
-			}
-			if err := os.Symlink(t.TempDir(), filepath.Join(bundle, "rootfs", "tmp")); err != nil {
-				t.Fatal(err)
-			}
-		}
-		i, err := r.start(context.Background(), id, bundle, id, []string{"PORT=wrong"})
-		if err != nil {
-			t.Fatal(err)
-		}
-		t.Cleanup(func() {
-			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
-			defer cancel()
-			_ = i.Stop(ctx)
-		})
-		if err := health.New(10*time.Millisecond, "/").Ready(context.Background(), i.Endpoint(), i, 5*time.Second); err != nil {
-			t.Fatal(err)
-		}
-		if ports[i.Port] || i.Port < 1024 {
-			t.Fatalf("overlapping deployments received invalid/shared port %d", i.Port)
-		}
-		ports[i.Port] = true
-		res, err := http.Get(i.Endpoint())
-		if err != nil {
-			t.Fatal(err)
-		}
-		body, err := io.ReadAll(res.Body)
-		_ = res.Body.Close()
-		if err != nil || string(body) != id {
-			t.Fatalf("deployment endpoint reached wrong workload: %q %v", body, err)
-		}
-		b, err := os.ReadFile(filepath.Join(bundle, "config.json"))
-		if err != nil {
-			t.Fatal(err)
-		}
-		var spec Spec
-		if err := json.Unmarshal(b, &spec); err != nil {
-			t.Fatal(err)
-		}
-		found, foundTmp := false, false
-		for _, mount := range spec.Mounts {
-			if mount.Destination == "/tmp" {
-				want, err := filepath.Abs(filepath.Join(bundle, "rootfs", "tmp"))
-				if err != nil || mount.Type != "bind" || mount.Source != want {
-					t.Fatalf("/tmp is not bound to the private disk directory: %+v %v", mount, err)
-				}
-				info, err := os.Lstat(want)
-				if err != nil || !info.IsDir() || info.Mode()&os.ModeSticky == 0 {
-					t.Fatalf("/tmp is not an owned sticky directory: %v %v", info, err)
-				}
-				foundTmp = true
-			}
-			if mount.Destination == "/etc/resolv.conf" {
-				contents, err := os.ReadFile(mount.Source)
-				if err != nil || string(contents) != string(resolver) || !filepath.IsAbs(mount.Source) || !strings.Contains(strings.Join(mount.Options, ","), "ro") {
-					t.Fatalf("owned read-only Docker DNS mount: %+v %v", mount, err)
-				}
-				found = true
-			}
-		}
-		if !found || !foundTmp {
-			t.Fatal("runtime did not provide Docker DNS and private disk-backed /tmp")
-		}
-	}
-}
-
-func TestDirectRunscHelper(t *testing.T) {
-	if os.Getenv("EASY_SERVICE_RUNSC_HELPER") != "1" {
-		return
-	}
-	args := strings.Join(os.Args, " ")
-	for _, required := range []string{"--rootless=true", "--platform=systrap", "--directfs=false", "--overlay2=none", "--network=host"} {
-		if !strings.Contains(args, required) {
-			t.Fatal("missing direct gVisor argument:", required)
-		}
-	}
-	var bundle string
-	for n, arg := range os.Args {
-		if arg == "--bundle" && n+1 < len(os.Args) {
-			bundle = os.Args[n+1]
-		}
-	}
-	b, err := os.ReadFile(filepath.Join(bundle, "config.json"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	var spec Spec
-	if err := json.Unmarshal(b, &spec); err != nil {
-		t.Fatal(err)
-	}
-	if !spec.Process.NoNewPrivileges || spec.Process.Cwd != "/app" {
-		t.Fatal("workload restrictions changed")
-	}
-	var port int
-	for _, item := range spec.Process.Env {
-		if strings.HasPrefix(item, "PORT=") {
-			port, err = strconv.Atoi(strings.TrimPrefix(item, "PORT="))
-			if err != nil {
-				t.Fatal(err)
-			}
-		}
-	}
-	listener, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", port))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer listener.Close()
-	if err := http.Serve(listener, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		fmt.Fprint(w, spec.Process.Args[2])
-	})); err != nil {
-		t.Fatal(err)
-	}
-}
-
-func TestProcessTreeMemoryIncludesChildFromAnotherThread(t *testing.T) {
-	// Keeping the launching thread occupied forces the fork onto another OS
-	// thread, whose /proc children file must also be walked.
-	runtime.LockOSThread()
-	defer runtime.UnlockOSThread()
-	result := make(chan error, 1)
-	go func() {
-		runtime.LockOSThread()
-		defer runtime.UnlockOSThread()
-		baseline, err := processTreeRSS(os.Getpid())
-		if err != nil {
-			result <- err
-			return
-		}
-		executable, err := os.Executable()
-		if err != nil {
-			result <- err
-			return
-		}
-		cmd := exec.Command(executable, "-test.run=^TestMemoryAllocationHelper$")
-		cmd.Env = append(os.Environ(), "EASY_SERVICE_MEMORY_HELPER=1")
-		stdout, err := cmd.StdoutPipe()
-		if err != nil {
-			result <- err
-			return
-		}
-		if err := cmd.Start(); err != nil {
-			result <- err
-			return
-		}
-		defer func() { _ = cmd.Process.Kill(); _ = cmd.Wait() }()
-		if _, err := bufio.NewReader(stdout).ReadString('\n'); err != nil {
-			result <- err
-			return
-		}
-		deadline := time.Now().Add(time.Second)
-		for time.Now().Before(deadline) {
-			var tree, child uint64
-			tree, err = processTreeRSS(os.Getpid())
-			if err != nil {
-				break
-			}
-			child, err = processTreeRSS(cmd.Process.Pid)
-			if err == nil && child >= 32<<20 && tree > baseline+child/2 {
-				result <- nil
-				return
-			}
-			time.Sleep(time.Millisecond)
-		}
-		result <- fmt.Errorf("child memory not sampled: %v", err)
-	}()
-	if err := <-result; err != nil {
-		t.Fatal(err)
-	}
-}
-
-func TestMemoryAllocationHelper(t *testing.T) {
-	if os.Getenv("EASY_SERVICE_MEMORY_HELPER") != "1" {
-		return
-	}
-	b := make([]byte, 64<<20)
-	for i := 0; i < len(b); i += os.Getpagesize() {
-		b[i] = 1
-	}
-	fmt.Println("ready")
-	time.Sleep(10 * time.Second)
-	runtime.KeepAlive(b)
 }

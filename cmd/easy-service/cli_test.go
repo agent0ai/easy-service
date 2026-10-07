@@ -35,6 +35,7 @@ func TestCLICommandsOverUnixSocket(t *testing.T) {
 		t.Fatal(err)
 	}
 	requests := make(chan string, 4)
+	samples := make(chan supervisor.Status, 1)
 	fail := make(chan struct{})
 	server := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		requests <- r.Method + " " + r.URL.Path
@@ -50,7 +51,12 @@ func TestCLICommandsOverUnixSocket(t *testing.T) {
 			return
 		default:
 		}
-		json.NewEncoder(w).Encode(supervisor.Status{State: "running", Revision: "commit", RuntimeImage: "node:22-bookworm-slim", Digest: "sha256:digest", MemoryBytes: 2 << 20, MemoryLimit: 512 << 20})
+		status := supervisor.Status{State: "running", Instance: "fixture", Revision: "commit", RuntimeImage: "node:22-bookworm-slim", Digest: "sha256:digest", MemoryBytes: 2 << 20, MemoryLimit: 512 << 20}
+		select {
+		case status = <-samples:
+		default:
+		}
+		json.NewEncoder(w).Encode(status)
 	})}
 	go server.Serve(listener)
 	t.Cleanup(func() { server.Close() })
@@ -66,12 +72,33 @@ func TestCLICommandsOverUnixSocket(t *testing.T) {
 		if request := <-requests; request != method+" /"+action {
 			t.Fatalf("request: %s", request)
 		}
-		want := "State: running\nRevision: commit\nImage: node:22-bookworm-slim\nDigest: sha256:digest\nMemory: 2.0 MiB\nMemory limit: 512.0 MiB (soft)\n"
+		want := "State: running\nRevision: commit\nImage: node:22-bookworm-slim\nDigest: sha256:digest\nApp CPU: 0.0%\nApp memory: 2.0 MiB\nInstance: fixture\nMemory limit: 512.0 MiB (soft)\n"
 		if action != "status" {
 			want = action + " completed\n" + want
 		}
 		if out.String() != want {
 			t.Fatalf("CLI output changed: %q", out.String())
+		}
+	}
+	for _, status := range []supervisor.Status{
+		{State: "waiting"},
+		{State: "unhealthy", Instance: "fixture", ResourceError: "sandbox process is not running"},
+	} {
+		samples <- status
+		var out bytes.Buffer
+		if err := cli([]string{"status"}, strings.NewReader(""), &out); err != nil {
+			t.Fatal(err)
+		}
+		<-requests
+		want := "App memory: not running\n"
+		if status.ResourceError != "" {
+			want = "App memory: unavailable\n"
+			if !strings.Contains(out.String(), "Resource sample: "+status.ResourceError) {
+				t.Fatal("memory sample failure lost from status")
+			}
+		}
+		if !strings.Contains(out.String(), want) || strings.Contains(out.String(), "0.0 MiB") {
+			t.Fatalf("missing memory measurement reported as zero: %q", out.String())
 		}
 	}
 	for _, args := range [][]string{{"unknown"}, {"status", "extra"}} {

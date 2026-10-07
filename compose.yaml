@@ -11,5 +11,3 @@ services:
       RUNTIME_IMAGE: node:22-bookworm-slim
       SETUP_COMMAND: npm ci
       RUN_COMMAND: node server.js
-    security_opt:
-      - seccomp=unconfined
