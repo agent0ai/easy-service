@@ -7,7 +7,7 @@ Own the implementation contracts for revision selection, installation, isolation
 - This file owns package boundaries and verification across the deployment flow.
 - Each child owns its implementation and regression tests; the command owns process wiring.
 - Flow: configuration defaults/overrides → revision/image → preparation → sandbox launch/output capture → health → atomic config/state publication → proxy cutover → drain → recovery.
-- Pending settings and retained logs remain independent of sandbox and cache cleanup.
+- Staged settings, durable apply submissions and retained logs remain independent of sandbox and cache cleanup.
 
 ## Local Contracts
 
@@ -28,7 +28,7 @@ Own the implementation contracts for revision selection, installation, isolation
 
 ## Child DOX Index
 
-- [config/AGENTS.md](config/AGENTS.md): public defaults, environment validation and durable staging.
+- [config/AGENTS.md](config/AGENTS.md): public defaults, environment validation, durable staging and apply submissions.
 - [revision/AGENTS.md](revision/AGENTS.md): Git/GitHub selection and exact checkouts.
 - [logs/AGENTS.md](logs/AGENTS.md): daily instance output files, rotation, retention and writer lifetime.
 - [image/AGENTS.md](image/AGENTS.md): digest resolution, OCI copy/unpack and image cache.

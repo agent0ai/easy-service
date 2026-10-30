@@ -7,6 +7,7 @@ Own the serialized deployment, cutover, drain and recovery engine.
 - `supervisor.go` owns desired-revision polling, preparation cache identity, deployment, memory replacement, watchers, recovery, shutdown and the HTTP listener.
 - `settings.go` owns apply classification, immutable candidate plans and policy publication; `settings_test.go` checks stage/apply/restart persistence, rollback, app-only SHA preservation, source/image changes and streaming.
 - `control.go` owns command execution through the engine, live status and the private Unix control socket; `control_test.go` checks commands through actual local Git, filesystems, sockets and HTTP with sandbox execution replaced.
+- `apply_test.go` checks queue coalescing during real HTTP drain, detached waiters, failed candidates followed by queued repair, restart of submitted snapshots, shutdown preservation and queued repairs after failed initial recovery.
 - `integration_test.go` uses real local Git/filesystem/HTTP boundaries with owned sandbox execution fakes.
 - `soak_test.go` owns opt-in deployment/traffic/resource stress verification. Its HTTP runtime fake drops retired instances so heap checks measure the engine rather than retained test servers.
 
@@ -18,9 +19,9 @@ Own the serialized deployment, cutover, drain and recovery engine.
 - An unconfigured redeploy reports missing Git/run settings immediately; it must not wait for an absent polling selector.
 - Explicit restart reuses the recovery path and current writable installation, consuming the automatic restart allowance. Repeated explicit restarts are allowed; failed restarts enter existing automatic recovery.
 - Initial recovery resumes the accepted sandbox only when revision, image, source, setup/run commands, app environment and health path match its saved hash. Use the existing readiness/publication path; a rejected resume falls back once to a fresh candidate. Policy-only applies preserve resume identity. Check Git after initial recovery so network selection cannot delay restoring service.
-- Request cancellation bounds command work; persistent controller/runtime contexts own published watchers and sandboxes. Committed cutover drain still completes.
-- Serve status concurrently with actions. Limit control clients to one pending/running action; use a 0700 control directory and 0600 Unix socket under DATA_DIR, recover stale sockets, and refuse to replace live sockets or ordinary files.
-- Status reports service state, short instance identity, pending configuration, active revision, runtime image/digest and CPU/RAM usage, limit or sampling error for all live setup/candidate/running/draining instances; keep internal lifecycle bookkeeping out of the status payload.
+- Request cancellation bounds restart/redeploy work; submitted applies use the supervisor context independently of waiting clients; persistent controller/runtime contexts own published watchers and sandboxes. Committed cutover drain still completes.
+- Serve status concurrently with actions. Limit restart/redeploy clients to one pending/running action; stage settings and accept/coalesce applies during deployment; use a 0700 control directory and 0600 Unix socket under DATA_DIR, recover stale sockets, and refuse to replace live sockets or ordinary files.
+- Status reports service state, short instance identity, pending configuration, active revision, runtime image/digest and CPU/RAM usage, limit or sampling error for all live setup/candidate/running/draining instances; include running/queued apply IDs and the last apply result/error without configuration values.
 - Save the configured Git source URL on deployment and recovery so startup cannot reuse a revision from another repository sharing the data directory.
 - Preparation identity includes format version 3, full SHA, image digest, setup command and application environment. The version invalidates installations prepared under the previous runtime ownership model. Runtime-assigned ports and run-command-only changes reuse preparation.
 - Reject invalid revision selections before filesystem/preparation work.
@@ -35,7 +36,8 @@ Own the serialized deployment, cutover, drain and recovery engine.
 - Retain filesystems if a stop cannot be confirmed; recovery cannot reuse a live installation or consume the restart allowance before stopping succeeds.
 - Use `state.Within` for owned filesystem cleanup bounds.
 - Use state.RemoveSandbox for instance/preparation deletion so stopped filesystem users remain reserved until their files are gone.
-- set/unset durably stage batches without deploying. apply validates the whole candidate, freezes its settings and saves accepted overrides with the revision before routing changes. Failed validation/preparation/readiness/persistence leaves accepted state untouched.
+- set/unset durably stage batches without deploying. POST /apply validates and durably freezes a snapshot, returns HTTP 202 with its ID, and signals Controller.Run. The controller processes one apply through the existing engine, including drain, then takes only the latest queued snapshot. POST /apply?wait=true waits for that submission; cancellation detaches only the waiter and supersession/failure returns an error. Save accepted overrides with the revision before routing changes. Failed validation/preparation/readiness/persistence leaves accepted state untouched.
+- Recover the accepted service once before consuming restored submissions; a failed recovery must not starve queued repairs. Preserve unfinished submissions when supervisor shutdown cancels preparation; do not automatically retry ordinary failed applies.
 - App variables, commands, image, health path and source-selection changes use the existing deployment/drain flow. App-only updates preserve the accepted SHA and digest; memory/polling/health-timing/timeouts/log policy update in place. Validate new Git credentials against the source.
 - Watchers capture their committed settings. Policy publication advances generation without replacing the backend; stale watcher events cannot affect the refreshed generation.
 - Stop and join old-source polling before apply; restart it with immutable committed settings and without an immediate unsolicited Git update.
@@ -52,6 +54,7 @@ Own the serialized deployment, cutover, drain and recovery engine.
 ## Verification
 
 - `go test -race ./internal/supervisor -count=20`.
+- `TestQueuedApplyCoalescesDuringDrain`, `TestApplyWaitDisconnectAndQueuedRepair` and `TestControllerResumesSubmittedApplyWithoutDraft` check asynchronous control, frozen snapshots, failures and recovery.
 - `TestStreamingDeploymentCutoverAndDrain` checks real SSE continuity through failed durable-state publication, successful cutover and cleanup on client disconnect or drain expiry.
 - `TestControlActionsWithLocalGit` checks repeated explicit restarts, surviving watchers, same-revision streaming redeploy, immediate Git updates, rejected candidates and failed-restart recovery. `TestControlSocketOwnershipAndCancellation` checks socket ownership, shutdown and cancelled actions.
 - `go test -race ./internal/supervisor -run TestDeploymentSoak -timeout 10m -v -args -soak=3m` exercises sustained traffic, updates, bad/stalled commits, replacement, repeated crashes and resource bounds.

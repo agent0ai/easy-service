@@ -175,7 +175,7 @@ func (s Store) Reconcile() error {
 			if !entry.Type().IsRegular() {
 				continue
 			}
-			for _, name := range []string{"active.json", "pending.json"} {
+			for _, name := range []string{"active.json", "pending.json", "apply.json"} {
 				prefix := name + ".tmp-"
 				if !strings.HasPrefix(entry.Name(), prefix) {
 					continue

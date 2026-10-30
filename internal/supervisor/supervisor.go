@@ -756,6 +756,7 @@ func (c *Controller) Run(ctx context.Context) {
 		go func() { defer close(done); c.poll(pollCtx, cfg, selector, immediate, updates, refresh) }()
 	}
 	initialRecovery := c.Initial != nil
+	restoreFirst := initialRecovery
 	startPoll(!initialRecovery)
 	defer func() { stopPoll(); <-pollDone }()
 	selected := c.Engine.Selected()
@@ -795,45 +796,74 @@ func (c *Controller) Run(ctx context.Context) {
 		pendingFailed = false
 		return true
 	}
+	runCommand := func(request command, submission *config.ApplyRequest) {
+		if request.action == "apply" {
+			stopPoll()
+			<-pollDone
+			select {
+			case <-updates:
+			default:
+			}
+		}
+		op, cancel := context.WithCancel(ctx)
+		stopCancel := context.AfterFunc(request.ctx, cancel)
+		if request.ctx.Err() != nil {
+			cancel()
+		}
+		var sha string
+		var err error
+		if submission != nil {
+			sha, err = c.apply(op, ctx, submission.Overrides)
+		} else {
+			sha, err = c.execute(op, ctx, request.action, refresh, updates)
+		}
+		if request.action == "apply" {
+			startPoll(false)
+		}
+		stopCancel()
+		cancel()
+		if err == nil {
+			recovery = nil
+			if sha != "" {
+				selected, pending, pendingFailed = sha, nil, false
+				initialRecovery, restoreFirst = false, false
+				retryTimer.Stop()
+				retry = nil
+			}
+		} else if c.Engine.Proxy.Current() == nil {
+			if generation := c.Engine.activeGeneration(); generation != 0 {
+				recovery = &generation
+				scheduleRetry(c.Cfg.HealthInterval)
+			}
+		}
+		if submission != nil && (err == nil || ctx.Err() == nil) {
+			c.Settings.FinishApply(submission, err)
+			result, _ := submission.Wait(context.Background())
+			log.Printf("configuration apply finished id=%d state=%s error=%s", result.ID, result.State, result.Error)
+		}
+		if request.result != nil {
+			request.result <- err
+		}
+	}
 	for {
+		if ctx.Err() != nil {
+			return
+		}
+		var applyReady <-chan struct{}
+		if c.Settings != nil && !restoreFirst {
+			applyReady = c.Settings.ApplyReady()
+		}
 		attempt := false
 		select {
 		case <-ctx.Done():
 			return
 		case request := <-c.commands:
-			if request.action == "apply" {
-				stopPoll()
-				<-pollDone
-				select {
-				case <-updates:
-				default:
-				}
+			runCommand(request, nil)
+			continue
+		case <-applyReady:
+			if submission := c.Settings.TakeApply(); submission != nil {
+				runCommand(command{ctx: ctx, action: "apply"}, submission)
 			}
-			op, cancel := context.WithCancel(ctx)
-			stopCancel := context.AfterFunc(request.ctx, cancel)
-			if request.ctx.Err() != nil {
-				cancel()
-			}
-			sha, err := c.execute(op, ctx, request.action, refresh, updates)
-			if request.action == "apply" {
-				startPoll(false)
-			}
-			stopCancel()
-			cancel()
-			if err == nil {
-				recovery = nil
-				if sha != "" {
-					selected, pending, pendingFailed = sha, nil, false
-					retryTimer.Stop()
-					retry = nil
-				}
-			} else if c.Engine.Proxy.Current() == nil {
-				if generation := c.Engine.activeGeneration(); generation != 0 {
-					recovery = &generation
-					scheduleRetry(c.Cfg.HealthInterval)
-				}
-			}
-			request.result <- err
 			continue
 		case s := <-updates:
 			attempt = acceptUpdate(s)
@@ -881,6 +911,7 @@ func (c *Controller) Run(ctx context.Context) {
 			continue
 		}
 		if pending != nil {
+			restoreFirst = false
 			s := *pending
 			if err := c.deploySelection(ctx, ctx, s); err != nil {
 				pendingFailed = true

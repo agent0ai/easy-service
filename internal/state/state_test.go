@@ -223,7 +223,7 @@ func TestAtomicWriteUsesPrivateTempAndReconcileRetainsConfig(t *testing.T) {
 	if err != nil || info.Mode().Perm() != 0600 {
 		t.Fatal("published credentials were not private")
 	}
-	for _, name := range []string{"active.json.tmp-1234", "pending.json.tmp-5678", "pending.json.tmp-not-ours"} {
+	for _, name := range []string{"active.json.tmp-1234", "pending.json.tmp-5678", "apply.json.tmp-9012", "apply.json", "apply.json.tmp-not-ours", "pending.json.tmp-not-ours"} {
 		if err := os.WriteFile(filepath.Join(dir, name), []byte("partial"), 0600); err != nil {
 			t.Fatal(err)
 		}
@@ -231,12 +231,12 @@ func TestAtomicWriteUsesPrivateTempAndReconcileRetainsConfig(t *testing.T) {
 	if err := (Store{Data: t.TempDir(), ConfigDir: dir}).Reconcile(); err != nil {
 		t.Fatal(err)
 	}
-	for _, name := range []string{"active.json.tmp-1234", "pending.json.tmp-5678"} {
+	for _, name := range []string{"active.json.tmp-1234", "pending.json.tmp-5678", "apply.json.tmp-9012"} {
 		if _, err := os.Stat(filepath.Join(dir, name)); !os.IsNotExist(err) {
 			t.Fatal("crashed atomic write was not collected")
 		}
 	}
-	for _, path := range []string{dst, dst + ".tmp", filepath.Join(dir, "pending.json.tmp-not-ours"), outside} {
+	for _, path := range []string{dst, dst + ".tmp", filepath.Join(dir, "pending.json.tmp-not-ours"), filepath.Join(dir, "apply.json"), filepath.Join(dir, "apply.json.tmp-not-ours"), outside} {
 		if _, err := os.Lstat(path); err != nil {
 			t.Fatal("reconciliation removed configuration/unowned data:", err)
 		}

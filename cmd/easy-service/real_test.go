@@ -143,7 +143,7 @@ func TestRealConfigurationCLIAndRestart(t *testing.T) {
 	if served("one") {
 		t.Fatal("set launched an application")
 	}
-	cli("config", "apply")
+	cli("config", "apply", "--wait")
 	wait(func() bool { return served("one") })
 	exported := cli("config", "show")
 	imported := exec.CommandContext(ctx, binary, "config", "set")
@@ -193,46 +193,50 @@ func TestRealConfigurationCLIAndRestart(t *testing.T) {
 	if _, err := io.ReadFull(stream.Body, make([]byte, len("data: tick\n\n"))); err != nil {
 		t.Fatal(err)
 	}
-	applied := make(chan error, 1)
-	go func() {
-		cmd := exec.CommandContext(ctx, binary, "config", "apply")
-		cmd.Env = env
-		b, err := cmd.CombinedOutput()
-		if err != nil {
-			err = fmt.Errorf("%v %s", err, b)
-		}
-		applied <- err
-	}()
+	started := time.Now()
+	if accepted := cli("config", "apply"); !strings.Contains(accepted, "accepted") || time.Since(started) > 2*time.Second {
+		t.Fatalf("async apply did not return promptly: %s", accepted)
+	}
+	t.Logf("asynchronous CLI apply returned in %s", time.Since(started))
 	wait(func() bool { return served("two") })
+	cli("config", "set", "APP_MESSAGE=skipped")
+	cli("config", "apply")
+	cli("config", "set", "APP_MESSAGE=four")
+	cli("config", "apply")
+	cli("config", "set", "APP_DRAFT=not-submitted")
+	if status := cli("status"); !strings.Contains(status, ": queued") || !strings.Contains(status, "running (includes draining)") {
+		t.Fatalf("missing queue during real drain: %s", status)
+	}
 	if killed := cli("kill-draining"); killed != "Killed 1 draining instances\n" {
 		t.Fatalf("urgent real kill: %q", killed)
 	}
-	select {
-	case err := <-applied:
-		if err != nil {
-			t.Fatal(err)
-		}
-	case <-time.After(3 * time.Second):
-		t.Fatal("urgent kill did not unblock real drain")
+	wait(func() bool { return served("four") && !strings.Contains(cli("status"), "running (includes draining)") })
+	acceptedState, err := (state.Store{Data: data, ConfigDir: cfgDir}).Load()
+	if err != nil || acceptedState.Overrides["APP_DRAFT"] != "" || acceptedState.Overrides["APP_MESSAGE"] != "four" {
+		t.Fatal("real queue activated a draft or lost submitted settings", err)
+	}
+	consoleOutput, err := os.ReadFile(consolePath)
+	if err != nil || strings.Contains(string(consoleOutput), "stdout skipped") {
+		t.Fatal("superseded configuration ran", err)
 	}
 	stream.Body.Close()
-	if killed := cli("kill-draining"); killed != "Killed 0 draining instances\n" || !served("two") {
+	if killed := cli("kill-draining"); killed != "Killed 0 draining instances\n" || !served("four") {
 		t.Fatal("empty force-stop touched the current app")
 	}
 	cli("config", "set", "RUN_COMMAND=false")
-	bad := exec.CommandContext(ctx, binary, "config", "apply")
+	bad := exec.CommandContext(ctx, binary, "config", "apply", "--wait")
 	bad.Env = env
 	if b, err := bad.CombinedOutput(); err == nil {
 		t.Fatalf("bad command accepted: %s", b)
 	}
-	if !served("two") {
+	if !served("four") {
 		t.Fatal("failed real candidate interrupted serving")
 	}
 	cli("config", "set", "RUN_COMMAND="+run)
-	cli("config", "apply")
+	cli("config", "apply", "--wait")
 	before := cli("status")
 	cli("config", "set", "LOG_RETENTION_DAYS=1", "LOG_MAX_FILE_SIZE=1K", "LOG_MAX_TOTAL_SIZE=1K")
-	cli("config", "apply")
+	cli("config", "apply", "--wait")
 	after := cli("status")
 	instance := func(status string) string {
 		for _, line := range strings.Split(status, "\n") {
@@ -242,7 +246,7 @@ func TestRealConfigurationCLIAndRestart(t *testing.T) {
 		}
 		return ""
 	}
-	if instance(before) == "" || instance(before) != instance(after) || !served("two") {
+	if instance(before) == "" || instance(before) != instance(after) || !served("four") {
 		t.Fatal("log policy replaced the real app instance")
 	}
 	files, _ := os.ReadDir(logDir)

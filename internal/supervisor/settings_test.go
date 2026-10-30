@@ -134,7 +134,7 @@ func TestStagedApplyStreamingRollbackAndPolicy(t *testing.T) {
 	old := active()
 	starts := rt.count()
 	stage(map[string]string{"APP_MODE": "docker"})
-	if code, body := request("POST", "/apply", nil); code != 200 || active() != old || rt.count() != starts {
+	if code, body := request("POST", "/apply?wait=true", nil); code != 200 || active() != old || rt.count() != starts {
 		t.Fatalf("same-value override was not saved without redeploy: %d %s", code, body)
 	}
 	if settings.Applied()["APP_MODE"] != "docker" {
@@ -171,7 +171,7 @@ func TestStagedApplyStreamingRollbackAndPolicy(t *testing.T) {
 	}
 	applied := make(chan error, 1)
 	go func() {
-		res, err := client.Post("http://local/apply", "", nil)
+		res, err := client.Post("http://local/apply?wait=true", "", nil)
 		if err == nil {
 			b, _ := io.ReadAll(res.Body)
 			res.Body.Close()
@@ -200,7 +200,7 @@ func TestStagedApplyStreamingRollbackAndPolicy(t *testing.T) {
 	}
 	old = active()
 	stage(map[string]string{"RUN_COMMAND": "fail-start", "APP_MODE": "bad"})
-	if code, _ := request("POST", "/apply", nil); code != 500 {
+	if code, _ := request("POST", "/apply?wait=true", nil); code != 500 {
 		t.Fatal("failed candidate accepted")
 	}
 	prior, err := store.Load()
@@ -211,18 +211,18 @@ func TestStagedApplyStreamingRollbackAndPolicy(t *testing.T) {
 		t.Fatal("failed apply changed active settings/revision/routing")
 	}
 	stage(map[string]string{"RUN_COMMAND": "serve", "APP_MODE": "pending", "POLL_INTERVAL": "0"})
-	if code, _ := request("POST", "/apply", nil); code != 500 || active() != old {
+	if code, _ := request("POST", "/apply?wait=true", nil); code != 500 || active() != old {
 		t.Fatal("invalid batch affected the application")
 	}
 	stage(map[string]string{"POLL_INTERVAL": "3600", "SERVICE_MEMORY_LIMIT": "0", "HEALTH_FAILURES": "4", "LOG_MAX_FILE_SIZE": "1K", "LOG_MAX_TOTAL_SIZE": "2K"})
 	starts = rt.count()
-	if code, body := request("POST", "/apply", nil); code != 200 {
+	if code, body := request("POST", "/apply?wait=true", nil); code != 200 {
 		t.Fatalf("policy apply: %d %s", code, body)
 	}
 	if active() != old || rt.count() != starts || e.Status().MemoryLimit != 0 {
 		t.Fatal("policy-only changes replaced the application")
 	}
-	if code, body := request("POST", "/apply", nil); code != 200 || rt.count() != starts {
+	if code, body := request("POST", "/apply?wait=true", nil); code != 200 || rt.count() != starts {
 		t.Fatalf("no-op apply replaced application: %d %s", code, body)
 	}
 	// Simulate a durable-write failure without changing the accepted state file.
@@ -232,7 +232,7 @@ func TestStagedApplyStreamingRollbackAndPolicy(t *testing.T) {
 		t.Fatal(err)
 	}
 	e.Store.ConfigDir = blocked
-	if code, _ := request("POST", "/apply", nil); code != 500 {
+	if code, _ := request("POST", "/apply?wait=true", nil); code != 500 {
 		t.Fatal("failed persistence accepted")
 	}
 	e.Store = store
@@ -240,7 +240,7 @@ func TestStagedApplyStreamingRollbackAndPolicy(t *testing.T) {
 		t.Fatal("persistence failure switched traffic/settings")
 	}
 	stage(map[string]string{"APP_MODE": "pending", "RUNTIME_IMAGE": "node:22-bookworm-slim"})
-	if code, body := request("POST", "/apply", nil); code != 200 || e.Status().Digest != "sha256:changed" || e.Selected() != first {
+	if code, body := request("POST", "/apply?wait=true", nil); code != 200 || e.Status().Digest != "sha256:changed" || e.Selected() != first {
 		t.Fatalf("image apply: %d %s", code, body)
 	}
 	// Explicit redeploy still checks Git immediately under the committed config.
@@ -253,7 +253,7 @@ func TestStagedApplyStreamingRollbackAndPolicy(t *testing.T) {
 	}
 	third := commitVersion(t, origin2, "three")
 	stage(map[string]string{"GIT_URL": origin2})
-	if code, body := request("POST", "/apply", nil); code != 200 || e.Selected() != third {
+	if code, body := request("POST", "/apply?wait=true", nil); code != 200 || e.Selected() != third {
 		t.Fatalf("source apply: %d %s", code, body)
 	}
 	base["APP_MODE"] = "changed-docker-default"
@@ -321,7 +321,7 @@ func TestUnconfiguredSupervisorAcceptsCLIConfiguration(t *testing.T) {
 	if res.StatusCode != 500 {
 		t.Fatal("unconfigured redeploy did not report missing configuration")
 	}
-	res, err = client.Post("http://local/apply", "", nil)
+	res, err = client.Post("http://local/apply?wait=true", "", nil)
 	if err != nil {
 		t.Fatal(err)
 	}

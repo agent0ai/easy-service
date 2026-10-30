@@ -29,7 +29,7 @@ func cli(args []string, in io.Reader, out io.Writer) error {
 	var requestBody io.Reader
 	var setValues map[string]string
 	path := "/" + action
-	configShow, staged := false, false
+	configShow, staged, waitApply := false, false, false
 	if action == "config" {
 		if len(args) < 2 {
 			return fmt.Errorf("usage: easy-service config [show [NAME...]|set NAME=value...|unset NAME...|apply]")
@@ -103,10 +103,14 @@ func cli(args []string, in io.Reader, out io.Writer) error {
 			}
 			requestBody = bytes.NewReader(body)
 		case "apply":
-			if len(args) != 2 {
-				return fmt.Errorf("config apply takes no arguments")
+			if len(args) != 2 && !(len(args) == 3 && args[2] == "--wait") {
+				return fmt.Errorf("usage: easy-service config apply [--wait]")
 			}
 			action, path = "apply", "/apply"
+			waitApply = len(args) == 3
+			if waitApply {
+				path += "?wait=true"
+			}
 		default:
 			return fmt.Errorf("unknown config command %q", args[1])
 		}
@@ -115,7 +119,7 @@ func cli(args []string, in io.Reader, out io.Writer) error {
 	}
 	switch action {
 	case "help", "--help", "-h":
-		_, err := fmt.Fprintln(out, "easy-service                 Start the supervisor\neasy-service status          Show the running revision and memory usage\neasy-service redeploy        Check Git now and deploy, even if unchanged\neasy-service restart         Restart the current writable installation\neasy-service kill-draining    Immediately kill all retired instances\neasy-service config show [NAME...]  Show all or selected pending settings\neasy-service config set [NAME=value...]  Stage arguments or read show-format lines from stdin; apply separately\neasy-service config unset NAME...  Remove overrides and use Docker defaults\neasy-service config apply     Validate and activate pending settings")
+		_, err := fmt.Fprintln(out, "easy-service                 Start the supervisor\neasy-service status          Show the running revision and memory usage\neasy-service redeploy        Check Git now and deploy, even if unchanged\neasy-service restart         Restart the current writable installation\neasy-service kill-draining    Immediately kill all retired instances\neasy-service config show [NAME...]  Show all or selected pending settings\neasy-service config set [NAME=value...]  Stage arguments or read show-format lines from stdin; apply separately\neasy-service config unset NAME...  Remove overrides and use Docker defaults\neasy-service config apply [--wait]  Submit staged settings; optionally wait for completion")
 		return err
 	case "status", "redeploy", "restart", "kill-draining", "config", "apply":
 	default:
@@ -149,6 +153,16 @@ func cli(args []string, in io.Reader, out io.Writer) error {
 		return fmt.Errorf("cannot contact easy-service: %w", err)
 	}
 	defer response.Body.Close()
+	if action == "apply" && !waitApply && response.StatusCode == http.StatusAccepted {
+		var result struct {
+			ID uint64 `json:"id"`
+		}
+		if err := json.NewDecoder(io.LimitReader(response.Body, 1<<20)).Decode(&result); err != nil {
+			return err
+		}
+		_, err := fmt.Fprintf(out, "Apply %d accepted. Use easy-service status to check progress.\n", result.ID)
+		return err
+	}
 	if response.StatusCode != http.StatusOK {
 		body, err := io.ReadAll(io.LimitReader(response.Body, 1<<20))
 		if err != nil {
@@ -205,7 +219,25 @@ func cli(args []string, in io.Reader, out io.Writer) error {
 		report = fmt.Appendf(report, "Instance: %s\n", status.Instance)
 	}
 	if status.ConfigPending {
-		report = fmt.Appendf(report, "Config: pending changes (run config apply)\n")
+		if status.Apply != nil && (status.Apply.Running != 0 || status.Apply.Queued != 0) {
+			report = fmt.Appendf(report, "Config: changes staged or being applied\n")
+		} else {
+			report = fmt.Appendf(report, "Config: pending changes (run config apply)\n")
+		}
+	}
+	if status.Apply != nil {
+		if status.Apply.Running != 0 {
+			report = fmt.Appendf(report, "Apply %d: running (includes draining)\n", status.Apply.Running)
+		}
+		if status.Apply.Queued != 0 {
+			report = fmt.Appendf(report, "Apply %d: queued\n", status.Apply.Queued)
+		}
+		if last := status.Apply.Last; last != nil {
+			report = fmt.Appendf(report, "Last apply %d: %s\n", last.ID, last.State)
+			if last.Error != "" {
+				report = fmt.Appendf(report, "Apply error: %s\n", last.Error)
+			}
+		}
 	}
 	if status.MemoryLimit > 0 {
 		report = fmt.Appendf(report, "Memory limit: %.1f MiB (soft)\n", float64(status.MemoryLimit)/(1<<20))

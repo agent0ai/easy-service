@@ -101,6 +101,19 @@ func TestCLICommandsOverUnixSocket(t *testing.T) {
 			t.Fatalf("missing memory measurement reported as zero: %q", out.String())
 		}
 	}
+	samples <- supervisor.Status{State: "running", ConfigPending: true, Apply: &config.ApplyStatus{
+		Running: 2, Queued: 4, Last: &config.ApplyResult{ID: 1, State: "failed", Error: "readiness failed"},
+	}}
+	var applyStatus bytes.Buffer
+	if err := cli([]string{"status"}, strings.NewReader(""), &applyStatus); err != nil {
+		t.Fatal(err)
+	}
+	<-requests
+	for _, want := range []string{"Apply 2: running (includes draining)", "Apply 4: queued", "Last apply 1: failed", "Apply error: readiness failed"} {
+		if !strings.Contains(applyStatus.String(), want) {
+			t.Fatalf("status missing %q: %s", want, &applyStatus)
+		}
+	}
 	for _, args := range [][]string{{"unknown"}, {"status", "extra"}} {
 		if err := cli(args, strings.NewReader(""), &bytes.Buffer{}); err == nil {
 			t.Fatalf("invalid arguments accepted: %v", args)
@@ -112,6 +125,10 @@ func TestCLICommandsOverUnixSocket(t *testing.T) {
 	close(fail)
 	if err := cli([]string{"redeploy"}, strings.NewReader(""), &bytes.Buffer{}); err == nil || !strings.Contains(err.Error(), "candidate rejected") {
 		t.Fatalf("action failure was not reported: %v", err)
+	}
+	<-requests
+	if err := cli([]string{"config", "apply", "--wait"}, strings.NewReader(""), io.Discard); err == nil || !strings.Contains(err.Error(), "candidate rejected") {
+		t.Fatalf("apply wait failure was not reported: %v", err)
 	}
 	<-requests
 	var killed bytes.Buffer
@@ -140,7 +157,16 @@ func TestConfigCLIArgumentsAndFilteredShow(t *testing.T) {
 	}
 	requests := make(chan string, 10)
 	server := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		requests <- r.Method + " " + r.URL.Path
+		path := r.URL.Path
+		if path == "/apply" && r.URL.RawQuery != "" {
+			path += "?" + r.URL.RawQuery
+		}
+		requests <- r.Method + " " + path
+		if path == "/apply" {
+			w.WriteHeader(http.StatusAccepted)
+			json.NewEncoder(w).Encode(config.ApplyResult{ID: 7, State: "accepted"})
+			return
+		}
 		if r.Method == "GET" {
 			values := map[string]string{"APP_KEY": "fixture-key", "APP_EMPTY": "", "RUN_COMMAND": "serve"}
 			if names := r.URL.Query()["name"]; len(names) > 0 {
@@ -184,7 +210,7 @@ func TestConfigCLIArgumentsAndFilteredShow(t *testing.T) {
 		t.Fatalf("show selected: %q %v", out.String(), err)
 	}
 	<-requests
-	for _, args := range [][]string{{"config", "set", "APP_KEY=value=with=equals", "APP_EMPTY="}, {"config", "unset", "APP_KEY", "APP_EMPTY"}, {"config", "apply"}} {
+	for _, args := range [][]string{{"config", "set", "APP_KEY=value=with=equals", "APP_EMPTY="}, {"config", "unset", "APP_KEY", "APP_EMPTY"}, {"config", "apply"}, {"config", "apply", "--wait"}} {
 		out.Reset()
 		if err := cli(args, strings.NewReader(""), &out); err != nil {
 			t.Fatal(err)
@@ -192,6 +218,11 @@ func TestConfigCLIArgumentsAndFilteredShow(t *testing.T) {
 		want := "POST /config"
 		if args[1] == "apply" {
 			want = "POST /apply"
+			if len(args) == 3 {
+				want += "?wait=true"
+			} else if out.String() != "Apply 7 accepted. Use easy-service status to check progress.\n" {
+				t.Fatalf("acceptance confused with completion: %q", out.String())
+			}
 		}
 		if got := <-requests; got != want {
 			t.Fatalf("request=%q want=%q", got, want)

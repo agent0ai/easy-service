@@ -20,7 +20,7 @@ Own persistent active state and reconciliation after supervisor restart.
 - Root-owned 0600 .easy-service-owner.json records sit outside each guest rootfs. Reacquire only matching stopped ownership; reject symlinks, writable metadata, changed rootfs ownership and another installation's lease. Reconstruct retained reservations before allocations if /run was lost.
 - At startup stop owned orphan processes, preserve only the accepted instance and prepared caches, and remove obsolete instance/runtime/deployment files. Leave other supervisors' leases untouched. Invalid saved filesystem ownership is discarded through bounded cleanup and rebuilt.
 - Sync the state directory after clearing the active record.
-- Reconcile stale runtime state before a new deployment. Preserve accepted configuration and its recovery identity; collect only owned numeric active/pending temporary files from interrupted writes. Store instances, runtime roots and preparation data separately under DATA_DIR.
+- Reconcile stale runtime state before a new deployment. Preserve accepted configuration and its recovery identity; collect only owned numeric active/pending/apply temporary files from interrupted writes. Preserve durable apply submissions/results. Store instances, runtime roots and preparation data separately under DATA_DIR.
 - Persist the configured Git URL with revision and image identity. `State.Recoverable` permits initial recovery only for the same non-empty source URL and runtime image; older records without source identity require fresh selection.
 - Propagate malformed state and cleanup errors to the process owner.
 

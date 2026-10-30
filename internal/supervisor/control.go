@@ -18,6 +18,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/example/easy-service/internal/config"
 	"github.com/example/easy-service/internal/process"
 	"github.com/example/easy-service/internal/revision"
 )
@@ -39,9 +40,6 @@ type selectionResult struct {
 }
 
 func (c *Controller) execute(ctx, watchCtx context.Context, action string, refresh chan<- selectionRequest, updates <-chan revision.Selection) (string, error) {
-	if action == "apply" {
-		return c.apply(ctx, watchCtx)
-	}
 	if action == "restart" {
 		generation := c.Engine.activeGeneration()
 		if generation == 0 {
@@ -80,17 +78,18 @@ func (c *Controller) execute(ctx, watchCtx context.Context, action string, refre
 }
 
 type Status struct {
-	Instance      string           `json:"instance,omitempty"`
-	ConfigPending bool             `json:"config_pending"`
-	State         string           `json:"state"`
-	Revision      string           `json:"revision,omitempty"`
-	RuntimeImage  string           `json:"runtime_image"`
-	Digest        string           `json:"digest,omitempty"`
-	MemoryBytes   uint64           `json:"memory_bytes"`
-	MemoryLimit   uint64           `json:"memory_limit"`
-	ResourceError string           `json:"resource_error,omitempty"`
-	CPUPercent    float64          `json:"cpu_percent"`
-	Instances     []InstanceStatus `json:"instances,omitempty"`
+	Instance      string              `json:"instance,omitempty"`
+	ConfigPending bool                `json:"config_pending"`
+	Apply         *config.ApplyStatus `json:"apply,omitempty"`
+	State         string              `json:"state"`
+	Revision      string              `json:"revision,omitempty"`
+	RuntimeImage  string              `json:"runtime_image"`
+	Digest        string              `json:"digest,omitempty"`
+	MemoryBytes   uint64              `json:"memory_bytes"`
+	MemoryLimit   uint64              `json:"memory_limit"`
+	ResourceError string              `json:"resource_error,omitempty"`
+	CPUPercent    float64             `json:"cpu_percent"`
+	Instances     []InstanceStatus    `json:"instances,omitempty"`
 }
 
 type InstanceStatus struct {
@@ -201,6 +200,8 @@ func (c *Controller) StartControl(ctx context.Context) (func(), error) {
 		status := c.Engine.Status()
 		if c.Settings != nil {
 			status.ConfigPending = !maps.Equal(c.Settings.Pending(), c.Settings.Applied())
+			apply := c.Settings.ApplyStatus()
+			status.Apply = &apply
 		}
 		_ = json.NewEncoder(w).Encode(status)
 	}
@@ -224,7 +225,7 @@ func (c *Controller) StartControl(ctx context.Context) (func(), error) {
 			Killed int `json:"killed"`
 		}{killed})
 	})
-	for _, name := range []string{"redeploy", "restart", "apply"} {
+	for _, name := range []string{"redeploy", "restart"} {
 		mux.HandleFunc("POST /"+name, func(w http.ResponseWriter, r *http.Request) {
 			if !action.TryLock() {
 				http.Error(w, "another action is in progress", http.StatusConflict)
@@ -256,6 +257,33 @@ func (c *Controller) StartControl(ctx context.Context) (func(), error) {
 			writeStatus(w, r)
 		})
 	}
+	mux.HandleFunc("POST /apply", func(w http.ResponseWriter, r *http.Request) {
+		if c.Settings == nil {
+			http.Error(w, "runtime configuration is unavailable", http.StatusServiceUnavailable)
+			return
+		}
+		submission, err := c.Settings.SubmitApply()
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		log.Printf("configuration apply accepted id=%d", submission.ID)
+		if r.URL.Query().Get("wait") == "true" {
+			result, err := submission.Wait(r.Context())
+			if err != nil {
+				return
+			}
+			if result.State != "completed" {
+				http.Error(w, result.Error, http.StatusInternalServerError)
+				return
+			}
+			writeStatus(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusAccepted)
+		_ = json.NewEncoder(w).Encode(map[string]any{"id": submission.ID, "state": "accepted"})
+	})
 	mux.HandleFunc("GET /config", func(w http.ResponseWriter, r *http.Request) {
 		if c.Settings == nil {
 			http.Error(w, "runtime configuration is unavailable", http.StatusServiceUnavailable)
@@ -282,11 +310,6 @@ func (c *Controller) StartControl(ctx context.Context) (func(), error) {
 			http.Error(w, "runtime configuration is unavailable", http.StatusServiceUnavailable)
 			return
 		}
-		if !action.TryLock() {
-			http.Error(w, "another action is in progress", http.StatusConflict)
-			return
-		}
-		defer action.Unlock()
 		var patch struct {
 			Values map[string]string `json:"values"`
 			Unset  []string          `json:"unset"`

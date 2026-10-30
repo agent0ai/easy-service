@@ -15,11 +15,13 @@ import (
 
 // Settings stores only overrides. Docker environment values remain defaults.
 // Accepted overrides share the active revision's atomic state record; pending
-// overrides are a separate file and never participate in automatic deployment.
+// overrides are a separate file; only explicit apply submissions deploy them.
 type Settings struct {
 	mu                     sync.RWMutex
 	base, applied, pending map[string]string
 	store                  state.Store
+	applies                applyQueue
+	applyReady             chan struct{}
 }
 
 func Open(base map[string]string, store state.Store) (*Settings, state.State, error) {
@@ -47,6 +49,9 @@ func Open(base map[string]string, store state.Store) (*Settings, state.State, er
 				return nil, prior, err
 			}
 		}
+	}
+	if err := s.loadApply(); err != nil {
+		return nil, prior, fmt.Errorf("load submitted configuration: %w", err)
 	}
 	return s, prior, nil
 }

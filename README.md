@@ -69,7 +69,8 @@ docker compose logs -f easy-service
   running. Retired logs remain subject to the normal retention rules.
 
 Inside the container, use `easy-service status`, `easy-service redeploy`, or
-`easy-service restart` directly. Actions wait for completion and report failures.
+`easy-service restart` directly. `restart` and `redeploy` wait for completion
+and report failures.
 During startup, status shows `waiting`. The CLI uses a private Unix socket;
 there is no extra network port to expose.
 
@@ -108,9 +109,21 @@ It restores escaped values exactly and never expands shell expressions. You can
 also pipe `config show` into `config set`. When copying all settings, directory
 values must match the target container's Docker configuration.
 
-`apply` validates the settings together. App variables, commands, runtime image
-and Git selection changes start a candidate, check readiness, switch traffic,
-then drain the old instance. App-variable changes keep the current commit and
+`apply` validates and durably submits the current staged settings, prints an
+apply ID, and returns immediately. Use `easy-service status` to see running and
+queued apply IDs and the last result/error. For scripts that need the final
+result, use `easy-service config apply --wait`; it waits through deployment and
+drain and exits nonzero on failure or if a newer submission replaces it.
+Closing the shell or interrupting a waiter does not cancel submitted work.
+
+Only one apply runs at a time. While it runs, you can keep using `set`, `unset`
+and `apply`. There is one pending snapshot: each newer apply replaces it, so
+all settings submitted so far deploy together after the current deployment
+finishes draining. Repeated identical submissions share an ID. Edits made after
+the last apply stay staged until you explicitly submit them.
+
+App variables, commands, runtime image and Git selection changes start a
+candidate, check readiness, switch traffic, then drain the old instance. App-variable changes keep the current commit and
 image digest. Memory, polling, health-check timing, timeout and log-retention
 changes update the supervisor without replacing the app. Git credentials are
 checked against the configured source. Failed applies keep the accepted settings
@@ -118,15 +131,18 @@ and healthy instance; pending changes remain available to correct and retry.
 Changing app variables reruns setup because setup receives those variables too.
 
 Settings survive stopping and restarting the same container. Docker environment
-values are defaults; saved overrides take precedence. Pending changes also
-survive restart, but only accepted settings start the app. A container without
-`GIT_URL` or `RUN_COMMAND` stays running in `waiting` so you can configure it
-using these commands.
+values are defaults; saved overrides take precedence. Staged settings also
+survive restart. The supervisor first restores the accepted service, then
+resumes the newest unfinished apply submission. Unsubmitted edits never deploy
+automatically. Failed applies remain failed until you submit again; if recording
+the result fails, status reports the storage problem and a restart can revisit
+the unfinished submission. A container without `GIT_URL` or `RUN_COMMAND` stays
+running in `waiting` so you can configure it using these commands.
 
 The supervisor prints configuration changes, setup, startup, readiness, cutover,
 drain, exits, recovery and log collection to the console. Configuration events
 list variable names without printing their values. `status` also reports the
-short instance ID and whether configuration changes are pending.
+short instance ID, staged-change indicator and apply progress.
 Runtime startup errors also appear in the console and retained instance logs.
 
 ## Additional settings

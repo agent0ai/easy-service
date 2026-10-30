@@ -26,13 +26,13 @@ func (c *Controller) deploySelection(ctx, watchCtx context.Context, sel revision
 	return c.Engine.deployWith(ctx, watchCtx, sel, nil, plan)
 }
 
-func (c *Controller) apply(ctx, watchCtx context.Context) (string, error) {
+func (c *Controller) apply(ctx, watchCtx context.Context, overrides map[string]string) (string, error) {
 	if c.Settings == nil {
 		return "", fmt.Errorf("runtime configuration is unavailable")
 	}
-	oldValues, values := c.Settings.Values(false), c.Settings.Values(true)
+	oldValues, values := c.Settings.Values(false), c.Settings.WithOverrides(overrides)
 	names := config.Changed(oldValues, values)
-	if len(names) == 0 && maps.Equal(c.Settings.Pending(), c.Settings.Applied()) {
+	if c.Engine.Selected() != "" && len(names) == 0 && maps.Equal(overrides, c.Settings.Applied()) {
 		log.Printf("configuration apply: no changes")
 		if c.Engine.Logs != nil {
 			if err := c.Engine.Logs.Trim(); err != nil {
@@ -53,7 +53,7 @@ func (c *Controller) apply(ctx, watchCtx context.Context) (string, error) {
 			c.Engine.collectFailed(plan, "")
 		}
 	}()
-	plan.Cfg, plan.Overrides = cfg, c.Settings.Pending()
+	plan.Cfg, plan.Overrides = cfg, overrides
 	plan.Health = health.New(cfg.HealthInterval, cfg.HealthPath)
 	selector := c.Selector
 	if c.Configure != nil {
@@ -61,7 +61,7 @@ func (c *Controller) apply(ctx, watchCtx context.Context) (string, error) {
 		if err != nil {
 			return "", err
 		}
-		plan.Overrides = c.Settings.Pending()
+		plan.Overrides = overrides
 	}
 	sha := c.Engine.Selected()
 	replace, selectSource := sha == "", sha == ""
