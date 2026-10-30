@@ -66,3 +66,20 @@ func TestExitInterruptsLivenessWait(t *testing.T) {
 		t.Fatal("process exit did not interrupt health wait")
 	}
 }
+
+func TestReadinessDoesNotWaitForLivenessInterval(t *testing.T) {
+	var calls atomic.Int64
+	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if calls.Add(1) == 1 {
+			w.WriteHeader(503)
+		}
+	}))
+	defer s.Close()
+	c := New(10*time.Second, "/")
+	if err := c.Ready(context.Background(), s.URL, newProc(), 2*time.Second); err != nil {
+		t.Fatal("ready application waited for the liveness interval:", err)
+	}
+	if c.Interval != 10*time.Second || calls.Load() != 2 {
+		t.Fatal("startup changed liveness policy")
+	}
+}

@@ -71,10 +71,10 @@ func (r Runtime) Prepare(ctx context.Context, id, base, checkout, setup string, 
 	}
 	defer func() {
 		if err != nil && !r.inUse(dir) {
-			_ = os.RemoveAll(dir)
+			_ = state.RemoveSandbox(r.Data, dir)
 		}
 	}()
-	if e := os.RemoveAll(dir); e != nil {
+	if e := state.RemoveSandbox(r.Data, dir); e != nil {
 		return "", e
 	}
 	if e := CopyTree(ctx, base, filepath.Join(dir, "rootfs")); e != nil {
@@ -143,16 +143,18 @@ func (r Runtime) Start(ctx, lifetime context.Context, id, prepared, command stri
 	ok := false
 	defer func() {
 		if !ok {
-			_ = os.RemoveAll(bundle)
+			_ = state.RemoveSandbox(r.Data, bundle)
 			_ = os.RemoveAll(root)
 		}
 	}()
-	if e := os.RemoveAll(bundle); e != nil {
+	if e := state.RemoveSandbox(r.Data, bundle); e != nil {
 		return nil, e
 	}
+	began := time.Now()
 	if e := CopyTree(ctx, filepath.Join(prepared, "rootfs"), filepath.Join(bundle, "rootfs")); e != nil {
 		return nil, e
 	}
+	log.Printf("sandbox copied instance=%s duration=%s", id, time.Since(began))
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -256,14 +258,13 @@ func (r Runtime) start(ctx context.Context, id, bundle, command string, env []st
 	if err := os.Chmod(bundle, 0711); err != nil {
 		return nil, err
 	}
-	owner, err := state.NewRuntimeOwner(data, id)
+	owner, reused, err := state.AcquireSandboxOwner(data, id, bundle)
 	if err != nil {
 		return nil, err
 	}
 	started := false
 	defer func() {
 		if !started {
-			_ = owner.Release()
 			_ = os.RemoveAll(owner.Root)
 		}
 	}()
@@ -294,10 +295,20 @@ func (r Runtime) start(ctx context.Context, id, bundle, command string, env []st
 		return nil, err
 	}
 	uid := strconv.FormatUint(uint64(owner.UID), 10)
-	if b, err := process.Output(process.Command(ctx, "chown", "-hR", uid+":"+uid, "--", rootfs, traceTmp)); err != nil {
-		return nil, fmt.Errorf("own instance filesystem: %w: %s", err, b)
+	if !reused {
+		began := time.Now()
+		if b, err := process.Output(process.Command(ctx, "chown", "-hR", uid+":"+uid, "--", rootfs)); err != nil {
+			return nil, fmt.Errorf("own instance filesystem: %w: %s", err, b)
+		}
+		log.Printf("sandbox ownership initialized instance=%s duration=%s", id, time.Since(began))
+	}
+	if err := os.Chown(traceTmp, int(owner.UID), int(owner.UID)); err != nil {
+		return nil, err
 	}
 	if err := os.Chmod(rootfs, 0700); err != nil {
+		return nil, err
+	}
+	if err := owner.SaveSandbox(); err != nil {
 		return nil, err
 	}
 	resolver, err := os.ReadFile("/etc/resolv.conf")
@@ -375,9 +386,6 @@ func (r Runtime) start(ctx context.Context, id, bundle, command string, env []st
 			}
 			log.Printf("instance process cleanup blocked instance=%s error=%v", logID, err)
 			time.Sleep(time.Second)
-		}
-		if err := owner.Release(); err != nil {
-			log.Printf("instance UID release failed instance=%s error=%v", logID, err)
 		}
 		close(i.done)
 		live.Delete(owner.Root)

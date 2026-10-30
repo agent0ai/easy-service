@@ -12,6 +12,7 @@ Own HTTP readiness/liveness observations of a running instance.
 - Only HTTP 2xx passes; do not follow redirects or use supervisor HTTP proxy environment.
 - Probe timeout is half the interval, capped at three seconds and at the remaining startup time, with a one-nanosecond minimum.
 - Process exit and context cancellation interrupt probes and waits.
+- Startup retry waits are capped at 250 ms without changing probe timeouts, running liveness intervals, failure thresholds or supervisor recovery pacing.
 - Successful probes reset only the consecutive-failure count.
 - Startup timeout diagnostics retain the last probe error.
 

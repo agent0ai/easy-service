@@ -8,6 +8,7 @@ import (
 	"github.com/example/easy-service/internal/health"
 	"github.com/example/easy-service/internal/logs"
 	"github.com/example/easy-service/internal/process"
+	"github.com/example/easy-service/internal/state"
 	"io"
 	"net/http"
 	"os"
@@ -126,7 +127,60 @@ func fakeNative(t *testing.T) Runtime {
 	}
 	t.Setenv("PATH", bin+":"+os.Getenv("PATH"))
 	t.Setenv("SUPERVISOR_ONLY_TEST", "must-stay-outside")
-	return Runtime{Data: filepath.Join(root, "data")}
+	r := Runtime{Data: filepath.Join(root, "data"), Stdout: os.Stdout, Stderr: os.Stderr}
+	t.Cleanup(func() {
+		if err := (state.Store{Data: r.Data}).Reconcile(); err != nil {
+			t.Error(err)
+		}
+		entries, _ := os.ReadDir(filepath.Join(r.Data, "prepared"))
+		for _, entry := range entries {
+			if err := state.RemoveSandbox(r.Data, filepath.Join(r.Data, "prepared", entry.Name())); err != nil {
+				t.Error(err)
+			}
+		}
+	})
+	return r
+}
+
+func TestRestartRetainsUserAndDoesNotWalkFilesystem(t *testing.T) {
+	r := fakeNative(t)
+	bundle := filepath.Join(r.Data, "instances", "original")
+	if err := os.MkdirAll(filepath.Join(bundle, "rootfs", "app"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	i, err := r.start(context.Background(), "original", bundle, "serve", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = i.Kill(context.Background()) })
+	if err := health.New(time.Millisecond, "/").Ready(context.Background(), i.Endpoint(), i, 5*time.Second); err != nil {
+		t.Fatal(err)
+	}
+	uid := i.owner.UID
+	marker := filepath.Join(bundle, "rootfs", "app", "retained")
+	if err := os.WriteFile(marker, []byte("kept"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	before, _ := os.Stat(marker)
+	for _, id := range []string{"restart-one", "restart-two"} {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		err = i.Stop(ctx)
+		cancel()
+		if err != nil {
+			t.Fatal(err)
+		}
+		i, err = r.Restart(context.Background(), id, bundle, "serve", nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := health.New(time.Millisecond, "/").Ready(context.Background(), i.Endpoint(), i, 5*time.Second); err != nil {
+			t.Fatal(err)
+		}
+		after, err := os.Stat(marker)
+		if err != nil || i.owner.UID != uid || !os.SameFile(before, after) || before.Sys().(*syscall.Stat_t).Ctim != after.Sys().(*syscall.Stat_t).Ctim {
+			t.Fatal("restart copied/reowned the installation or changed its reserved user")
+		}
+	}
 }
 func TestPrivateWritableCopies(t *testing.T) {
 	base := t.TempDir()
@@ -349,7 +403,7 @@ func TestRuntimeFailurePreservesOutputAndWaitResult(t *testing.T) {
 	for n := 0; n < 3; n++ {
 		err := i.Wait(context.Background())
 		if exit, ok := err.(*exec.ExitError); !ok || exit.ExitCode() != 23 {
-			t.Fatalf("wait consumed error: %v", err)
+			t.Fatalf("wait consumed error: %v; stderr=%s", err, stderr.String())
 		}
 	}
 	entries, err := os.ReadDir(directory)

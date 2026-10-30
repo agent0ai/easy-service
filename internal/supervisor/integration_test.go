@@ -288,8 +288,8 @@ func TestLocalGitBadCommitsStallsCrashesAndFreshRecovery(t *testing.T) {
 	t.Setenv("RUN_COMMAND", "test-boundary")
 	t.Setenv("DATA_DIR", t.TempDir())
 	t.Setenv("POLL_INTERVAL", "0.01")
-	t.Setenv("HEALTH_INTERVAL", "0.01")
-	t.Setenv("STARTUP_TIMEOUT", "0.1")
+	t.Setenv("HEALTH_INTERVAL", "0.1")
+	t.Setenv("STARTUP_TIMEOUT", "0.5")
 	t.Setenv("HEALTH_FAILURES", "2")
 	t.Setenv("SERVICE_MEMORY_LIMIT", "0")
 	t.Setenv("HEALTH_PATH", "/health")
@@ -382,6 +382,11 @@ func TestLocalGitBadCommitsStallsCrashesAndFreshRecovery(t *testing.T) {
 		t.Fatalf("deployment/recovery did not preserve exact source identity: state=%+v err=%v", saved, err)
 	}
 	for _, name := range []string{"prepared", "instances"} {
+		// Publication precedes retired-filesystem cleanup in the controller.
+		waitFor(t, func() bool {
+			entries, err := os.ReadDir(filepath.Join(cfg.DataDir, name))
+			return err == nil && len(entries) == 1
+		})
 		entries, err := os.ReadDir(filepath.Join(cfg.DataDir, name))
 		if err != nil || len(entries) != 1 {
 			t.Fatalf("%s retained failed/retired data: count=%d err=%v", name, len(entries), err)

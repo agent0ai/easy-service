@@ -3,6 +3,7 @@ package state
 import (
 	"encoding/json"
 	"errors"
+	"log"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -11,6 +12,7 @@ import (
 
 type State struct {
 	Revision, Digest, GitURL, ImageRef string
+	Sandbox, ResumeKey                 string            `json:",omitempty"`
 	Overrides                          map[string]string `json:"overrides,omitempty"`
 }
 
@@ -92,14 +94,66 @@ func (s Store) Clear() error {
 	return syncDir(s.directory())
 }
 func (s Store) Reconcile() error {
-	_, e := s.Load()
+	v, e := s.Load()
 	if e != nil && !errors.Is(e, os.ErrNotExist) {
 		return e
 	}
 	if err := reconcileRuntimeOwners(s.Data); err != nil {
 		return err
 	}
-	for _, name := range []string{"instances", "runtime", "deployments"} {
+	instances := filepath.Join(s.Data, "instances")
+	keep := ""
+	if v.Sandbox != "" && filepath.Base(v.Sandbox) == v.Sandbox {
+		bundle := filepath.Join(instances, v.Sandbox)
+		if _, err := SandboxOwner(s.Data, bundle); err == nil {
+			keep = v.Sandbox
+		}
+	}
+	entries, err := os.ReadDir(instances)
+	if err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	for _, entry := range entries {
+		if entry.Name() == keep {
+			continue
+		}
+		path := filepath.Join(instances, entry.Name())
+		if entry.IsDir() {
+			if err := RemoveSandbox(s.Data, path); err != nil {
+				return err
+			}
+		} else if err := os.Remove(path); err != nil {
+			return err
+		}
+	}
+	if keep == "" {
+		_ = os.Remove(instances)
+	}
+	// /run can be lost while /data survives; reserve retained filesystem users
+	// before any new setup or candidate can allocate them.
+	for _, area := range []string{"instances", "prepared"} {
+		entries, err := os.ReadDir(filepath.Join(s.Data, area))
+		if err != nil && !os.IsNotExist(err) {
+			return err
+		}
+		for _, entry := range entries {
+			bundle := filepath.Join(s.Data, area, entry.Name())
+			owner, err := SandboxOwner(s.Data, bundle)
+			if os.IsNotExist(err) {
+				continue
+			} // installation from an older supervisor
+			if err == nil {
+				_, _, err = AcquireSandboxOwner(s.Data, filepath.Base(owner.Root), bundle)
+			}
+			if err != nil {
+				log.Printf("discarding unusable saved sandbox=%s: %v", entry.Name(), err)
+				if err := RemoveSandbox(s.Data, bundle); err != nil {
+					return err
+				}
+			}
+		}
+	}
+	for _, name := range []string{"runtime", "deployments"} {
 		path := filepath.Join(s.Data, name)
 		if !Within(s.Data, path) {
 			return errors.New("unsafe cleanup path")
@@ -134,6 +188,9 @@ func (s Store) Reconcile() error {
 				}
 			}
 		}
+		return nil
+	}
+	if v.Sandbox != "" {
 		return nil
 	}
 	return s.Clear()

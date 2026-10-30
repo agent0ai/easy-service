@@ -17,6 +17,7 @@ Own the serialized deployment, cutover, drain and recovery engine.
 - CLI actions enter Controller.Run. Redeploy requests immediate selection from the existing polling worker, discards older queued samples and forces ordinary deployment even for the same revision; prepared dependencies remain reusable.
 - An unconfigured redeploy reports missing Git/run settings immediately; it must not wait for an absent polling selector.
 - Explicit restart reuses the recovery path and current writable installation, consuming the automatic restart allowance. Repeated explicit restarts are allowed; failed restarts enter existing automatic recovery.
+- Initial recovery resumes the accepted sandbox only when revision, image, source, setup/run commands, app environment and health path match its saved hash. Use the existing readiness/publication path; a rejected resume falls back once to a fresh candidate. Policy-only applies preserve resume identity. Check Git after initial recovery so network selection cannot delay restoring service.
 - Request cancellation bounds command work; persistent controller/runtime contexts own published watchers and sandboxes. Committed cutover drain still completes.
 - Serve status concurrently with actions. Limit control clients to one pending/running action; use a 0700 control directory and 0600 Unix socket under DATA_DIR, recover stale sockets, and refuse to replace live sockets or ordinary files.
 - Status reports service state, short instance identity, pending configuration, active revision, runtime image/digest and CPU/RAM usage, limit or sampling error for all live setup/candidate/running/draining instances; keep internal lifecycle bookkeeping out of the status payload.
@@ -32,6 +33,7 @@ Own the serialized deployment, cutover, drain and recovery engine.
 - Clean failed/private deployment filesystems and bound retained prepared caches; exclude every live setup filesystem from invalidation and collection until termination is confirmed.
 - Retain filesystems if a stop cannot be confirmed; recovery cannot reuse a live installation or consume the restart allowance before stopping succeeds.
 - Use `state.Within` for owned filesystem cleanup bounds.
+- Use state.RemoveSandbox for instance/preparation deletion so stopped filesystem users remain reserved until their files are gone.
 - set/unset durably stage batches without deploying. apply validates the whole candidate, freezes its settings and saves accepted overrides with the revision before routing changes. Failed validation/preparation/readiness/persistence leaves accepted state untouched.
 - App variables, commands, image, health path and source-selection changes use the existing deployment/drain flow. App-only updates preserve the accepted SHA and digest; memory/polling/health-timing/timeouts/log policy update in place. Validate new Git credentials against the source.
 - Watchers capture their committed settings. Policy publication advances generation without replacing the backend; stale watcher events cannot affect the refreshed generation.
@@ -54,6 +56,7 @@ Own the serialized deployment, cutover, drain and recovery engine.
 - `go test -race ./internal/supervisor -run TestDeploymentSoak -timeout 10m -v -args -soak=3m` exercises sustained traffic, updates, bad/stalled commits, replacement, repeated crashes and resource bounds.
 - TestKillAllRetiredInstancesKeepsActiveAndCleansFailedStops and TestControlActionsWithLocalGit verify urgent force-stop while redeploy is blocked by a live SSE stream.
 - Real OCI/PRoot execution under default Docker policies remains a separate check.
+- TestSavedSandboxResumeAndFreshFallback checks reuse of writable state, policy persistence, rejected/missing saved installations, failed state publication and changed environment/command/image inputs. Publication failure or cancelled initial recovery preserves accepted files.
 
 ## Child DOX Index
 

@@ -13,6 +13,7 @@ Own the implementation contracts for revision selection, installation, isolation
 
 - Use the serialized deployment engine for revision updates, memory replacement, CLI actions and recovery.
 - Preserve exact revision/image identity and private writable filesystem ownership throughout the flow.
+- Accepted sandbox identity survives supervisor restart. Reuse filesystem/user ownership only for matching deployment inputs; startup readiness retries are capped at 250 ms while normal liveness/recovery timing stays configured.
 - Owned fakes must preserve the production boundary's lifetime, errors, filesystem effects and completion semantics.
 
 ## Work Guidance

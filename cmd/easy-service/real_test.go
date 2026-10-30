@@ -373,7 +373,7 @@ func TestRealGoImageEnvironmentAndSetup(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 	images := imagepkg.Manager{Data: realDirectory(t), Runner: process.Runner{}}
-	image, err := images.Prepare(ctx, "golang:1.27.1-bookworm")
+	image, err := images.Prepare(ctx, "golang:1.27.3-bookworm")
 	if err != nil {
 		t.Fatal(err)
 	}

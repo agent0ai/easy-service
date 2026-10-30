@@ -80,6 +80,7 @@ type Deployment struct {
 }
 
 type Engine struct {
+	Restore        *state.State
 	Cfg            config.Config
 	Overrides      map[string]string
 	Logs           *logs.Manager
@@ -199,35 +200,78 @@ func (e *Engine) deployWith(ctx, watchCtx context.Context, sel revision.Selectio
 	if err != nil {
 		return err
 	}
-	log.Printf("preparing candidate instance=%s revision=%s", id, sel.SHA)
-	prepared, err = e.prepareWith(ctx, sel.SHA, id, plan)
-	if err != nil {
-		return err
+	resume := ""
+	if saved := e.Restore; saved != nil && saved.ResumeKey == resumeKey(sel.SHA, plan.Digest, plan.Cfg) && saved.Sandbox != "" {
+		bundle := filepath.Join(plan.Cfg.DataDir, "instances", saved.Sandbox)
+		if filepath.Base(saved.Sandbox) == saved.Sandbox && state.SandboxPath(plan.Cfg.DataDir, bundle) {
+			resume = bundle
+		}
 	}
-	// Runtime.Start binds the sandbox process lifetime to its context. Operations
-	// and health watches may be cancelled before graceful proxy drain completes,
-	// so active processes use the engine-owned runtime context instead.
-	e.registerLog(id, id, sel.SHA, plan)
-	log.Printf("starting candidate instance=%s revision=%s", id, sel.SHA)
-	candidate, err := plan.Runtime.Start(ctx, e.runtimeContext(watchCtx), id, prepared, plan.Cfg.RunCommand, plan.Cfg.AppEnv)
-	if e.Logs != nil {
-		e.Logs.Forget(id)
-	}
-	if err != nil {
-		e.invalidatePrepared(prepared)
-		return fmt.Errorf("start candidate: %w", err)
-	}
-	if err = plan.Health.Ready(ctx, candidate.Endpoint(), candidate, plan.Cfg.StartupTimeout); err != nil {
-		e.cleanup(candidate, true)
-		return fmt.Errorf("candidate rejected: %w", err)
+	var candidate Instance
+	for {
+		if resume == "" {
+			log.Printf("preparing candidate instance=%s revision=%s", id, sel.SHA)
+			prepared, err = e.prepareWith(ctx, sel.SHA, id, plan)
+			if err != nil {
+				return err
+			}
+		} else {
+			prepared = filepath.Join(plan.Cfg.DataDir, "prepared", preparedID(sel.SHA, plan.Digest, plan.Cfg))
+		}
+		e.registerLog(id, id, sel.SHA, plan)
+		// The runtime context outlives deployment requests and health watches.
+		if resume != "" {
+			log.Printf("resuming candidate instance=%s revision=%s", id, sel.SHA)
+			candidate, err = plan.Runtime.Restart(e.runtimeContext(watchCtx), id, resume, plan.Cfg.RunCommand, plan.Cfg.AppEnv)
+		} else {
+			log.Printf("starting candidate instance=%s revision=%s", id, sel.SHA)
+			candidate, err = plan.Runtime.Start(ctx, e.runtimeContext(watchCtx), id, prepared, plan.Cfg.RunCommand, plan.Cfg.AppEnv)
+		}
+		if e.Logs != nil {
+			e.Logs.Forget(id)
+		}
+		startFailed := err != nil
+		if err == nil {
+			err = plan.Health.Ready(ctx, candidate.Endpoint(), candidate, plan.Cfg.StartupTimeout)
+			if err != nil {
+				e.cleanup(candidate, resume == "" || ctx.Err() == nil)
+			}
+		}
+		if err == nil {
+			break
+		}
+		if resume == "" {
+			if startFailed {
+				e.invalidatePrepared(prepared)
+			}
+			return fmt.Errorf("candidate rejected: %w", err)
+		}
+		log.Printf("saved sandbox rejected; preparing fresh installation: %v", err)
+		e.Restore.ResumeKey = ""
+		resume = ""
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		id, err = e.nextID()
+		if err != nil {
+			return err
+		}
 	}
 	a := &Active{Revision: sel.SHA, Digest: plan.Digest, Prepared: prepared, Instance: candidate}
 	old, err := e.publishWith(ctx, watchCtx, a, expected, plan)
 	if err != nil {
-		e.cleanup(candidate, true)
+		e.cleanup(candidate, resume == "")
 		return err
 	}
 	committed = true
+	if saved := e.Restore; saved != nil {
+		if saved.Sandbox != "" && saved.Sandbox != filepath.Base(candidate.BundlePath()) && filepath.Base(saved.Sandbox) == saved.Sandbox {
+			if err := state.RemoveSandbox(plan.Cfg.DataDir, filepath.Join(plan.Cfg.DataDir, "instances", saved.Sandbox)); err != nil {
+				log.Printf("previous sandbox cleanup failed: %v", err)
+			}
+		}
+		e.Restore = nil
+	}
 	log.Printf("candidate healthy; cut over instance=%s revision=%s", id, sel.SHA)
 	if old != nil {
 		// Once routing has changed, retiring the old backend is committed
@@ -273,7 +317,7 @@ func (e *Engine) publishWith(ctx, watchCtx context.Context, a *Active, expected 
 	}
 	e.seq++
 	a.Backend, a.generation = backend, e.seq
-	if err = e.Store.Save(state.State{Revision: a.Revision, Digest: a.Digest, GitURL: plan.Cfg.GitURL, ImageRef: plan.Cfg.RuntimeImage, Overrides: plan.Overrides}); err != nil {
+	if err = e.Store.Save(deploymentState(a, plan)); err != nil {
 		return nil, err
 	}
 	e.Cfg, e.Overrides, e.Runtime, e.Checkout, e.Health, e.Rootfs, e.Digest = plan.Cfg, plan.Overrides, plan.Runtime, plan.Checkout, plan.Health, plan.Rootfs, plan.Digest
@@ -416,9 +460,7 @@ func (e *Engine) invalidatePrepared(path string) {
 		}
 	}
 	root := filepath.Join(e.Cfg.DataDir, "prepared")
-	if state.Within(root, path) {
-		_ = os.RemoveAll(path)
-	}
+	e.removeInstancePath(root, path)
 }
 func (e *Engine) removeOtherPrepared(keep ...string) {
 	root := filepath.Join(e.Cfg.DataDir, "prepared")
@@ -442,6 +484,24 @@ func preparedID(sha, digest string, cfg config.Config) string {
 	b, _ := json.Marshal(inputs)
 	h := sha256.Sum256(b)
 	return hex.EncodeToString(h[:])
+}
+
+func resumeKey(sha, digest string, cfg config.Config) string {
+	b, _ := json.Marshal([]string{preparedID(sha, digest, cfg), cfg.GitURL, cfg.RuntimeImage, cfg.RunCommand, cfg.HealthPath})
+	h := sha256.Sum256(b)
+	return hex.EncodeToString(h[:])
+}
+
+func deploymentState(a *Active, plan Deployment) state.State {
+	v := state.State{GitURL: plan.Cfg.GitURL, ImageRef: plan.Cfg.RuntimeImage, Overrides: plan.Overrides}
+	if a != nil {
+		v.Revision, v.Digest = a.Revision, a.Digest
+		if filepath.Dir(a.Instance.BundlePath()) == filepath.Join(plan.Cfg.DataDir, "instances") {
+			v.Sandbox = filepath.Base(a.Instance.BundlePath())
+			v.ResumeKey = resumeKey(a.Revision, a.Digest, plan.Cfg)
+		}
+	}
+	return v
 }
 func (e *Engine) Recover(ctx context.Context, generation uint64) error {
 	return e.recover(ctx, ctx, generation, false)
@@ -632,6 +692,12 @@ func (e *Engine) cleanup(i Instance, bundle bool) {
 }
 func (e *Engine) removeInstancePath(root, path string) {
 	if state.Within(root, path) {
+		if filepath.Base(root) == "instances" || filepath.Base(root) == "prepared" {
+			if err := state.RemoveSandbox(filepath.Dir(root), path); err != nil {
+				log.Printf("sandbox cleanup failed: %v", err)
+			}
+			return
+		}
 		_ = os.RemoveAll(path)
 	}
 }
@@ -661,7 +727,8 @@ func (c *Controller) Run(ctx context.Context) {
 		cfg, selector, done := c.Cfg, c.Selector, pollDone
 		go func() { defer close(done); c.poll(pollCtx, cfg, selector, immediate, updates, refresh) }()
 	}
-	startPoll(true)
+	initialRecovery := c.Initial != nil
+	startPoll(!initialRecovery)
 	defer func() { stopPoll(); <-pollDone }()
 	selected := c.Engine.Selected()
 	pending := c.Initial
@@ -792,6 +859,12 @@ func (c *Controller) Run(ctx context.Context) {
 				scheduleRetry(c.Cfg.HealthInterval)
 			} else {
 				selected, pending, recovery = s.SHA, nil, nil
+				if initialRecovery {
+					initialRecovery = false
+					stopPoll()
+					<-pollDone
+					startPoll(true)
+				}
 				continue
 			}
 		}

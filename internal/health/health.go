@@ -74,7 +74,7 @@ func (c *Checker) Ready(ctx context.Context, base string, p Exited, startup time
 		if remaining <= 0 {
 			return fmt.Errorf("startup health timeout: %w", err)
 		}
-		wait := c.Interval
+		wait := min(c.Interval, 250*time.Millisecond)
 		if wait > remaining {
 			wait = remaining
 		}

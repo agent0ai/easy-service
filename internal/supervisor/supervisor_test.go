@@ -501,7 +501,7 @@ func TestBrokenPendingUpdateDoesNotStarveActiveRecovery(t *testing.T) {
 		r.mu.Lock()
 		restarts := r.restarts
 		r.mu.Unlock()
-		if restarts == 1 {
+		if restarts == 1 && e.Proxy.Current() != nil && e.Selected() == a.SHA {
 			break
 		}
 		select {

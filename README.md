@@ -61,7 +61,8 @@ docker compose logs -f easy-service
   fails. Measurements include detached child processes. CPU is a sampled percentage; 100% means one fully used CPU core.
 - `redeploy` checks Git immediately and creates a fresh writable installation,
   even if the revision has not changed. It reuses the prepared dependencies.
-- `restart` restarts the current revision with its existing writable files.
+- `restart` restarts the current revision with its existing writable files and
+  reserved Linux user, without copying or recursively changing file ownership.
   This briefly interrupts service.
 - `kill-draining` immediately force-stops all retired instances, even while
   `apply` or `redeploy` waits for them to drain. It leaves the current instance
@@ -141,7 +142,7 @@ All of these are optional. Times are in seconds.
 | `POLL_INTERVAL` | `300` | How often to check Git. |
 | `HEALTH_PATH` | `/` | URL path that must return a 2xx response. |
 | `STARTUP_TIMEOUT` | `60` | How long to wait for a new service to become healthy after setup. |
-| `HEALTH_INTERVAL` | `10` | Time between health checks and recovery retries. |
+| `HEALTH_INTERVAL` | `10` | Time between running health checks and recovery retries. Startup retries are capped at 250 ms. |
 | `HEALTH_FAILURES` | `3` | Consecutive failed checks before recovery. |
 | `SETUP_TIMEOUT` | `900` | Maximum setup time. |
 | `DRAIN_TIMEOUT` | `30` | Time allowed for existing requests and streams to finish before stopping an old instance. |
@@ -206,7 +207,16 @@ the old version. Increase Docker's stop grace period when increasing this timeou
 Crashes and failed health checks trigger one restart, followed by a fresh
 installation on another failure. Recovery keeps retrying. Application writes
 are temporary across redeployments; keep databases and durable files elsewhere.
-Restarting the outer container can cause an outage.
+Restarting the outer container briefly interrupts service, then resumes the last
+accepted sandbox with its existing files and reserved user. It uses the accepted
+cached image digest before contacting the registry and checks Git after recovery.
+Changed deployment settings or an unavailable/unhealthy saved sandbox use the
+normal fresh-installation path. Older installations without resume metadata take
+one normal startup before subsequent restarts can reuse their sandbox. No extra
+configuration is needed. Recreating the container requires retaining both
+`/config` and `/data` to resume it.
+To deploy a newer runtime image, set `RUNTIME_IMAGE` to its new tag or digest and
+apply the change; restarting preserves the previously accepted image.
 
 Streaming uploads, streamed responses, SSE, and WebSockets are supported over
 HTTP/1.1. Use a trusted reverse proxy for HTTPS and client HTTP/2 or HTTP/3.
@@ -225,9 +235,14 @@ must allow directory traversal. The default `/data` works as supplied.
 
 ## Development
 
-Run `make check` with Go 1.23+ and Python 3. The [DOX instructions](AGENTS.md)
+Run `make check` with Go 1.27.3+ and Python 3. The [DOX instructions](AGENTS.md)
 document each package's ownership and tests, including optional real OCI/runtime
 and load checks.
+
+The supervisor image uses Debian 13 (trixie) with package updates applied at build
+time. The service and bundled OCI tools use Go 1.27.3. Rebuild with
+`docker compose build --pull --no-cache` to pick up base-image and Debian security
+updates; existing images are not updated in place.
 
 Pushing the highest version tag publishes `agent0ai/easy-service:<git-tag>` for
 amd64 and arm64, plus `agent0ai/easy-service:latest`. Versions are compared as

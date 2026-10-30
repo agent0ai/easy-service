@@ -11,7 +11,6 @@ import (
 	"github.com/example/easy-service/internal/health"
 	"github.com/example/easy-service/internal/logs"
 	"github.com/example/easy-service/internal/revision"
-	"github.com/example/easy-service/internal/state"
 )
 
 func (c *Controller) deploySelection(ctx, watchCtx context.Context, sel revision.Selection) error {
@@ -124,10 +123,7 @@ func (e *Engine) commitPolicy(ctx, watchCtx context.Context, plan Deployment) er
 		return err
 	}
 	a := e.active
-	v := state.State{GitURL: plan.Cfg.GitURL, ImageRef: plan.Cfg.RuntimeImage, Overrides: plan.Overrides}
-	if a != nil {
-		v.Revision, v.Digest = a.Revision, a.Digest
-	}
+	v := deploymentState(a, plan)
 	if err := e.Store.Save(v); err != nil {
 		return err
 	}

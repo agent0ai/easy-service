@@ -122,6 +122,7 @@ func run(ctx context.Context, cfg config.Config, p *proxy.Proxy, settings *confi
 	if err := store.Reconcile(); err != nil {
 		return fmt.Errorf("restart reconciliation: %w", err)
 	}
+	engine.Restore = &prior
 	var capture *logs.Manager
 	if cfg.LogDir != "" {
 		capture, err = logs.New(cfg.LogDir, logs.Policy{Days: cfg.LogRetentionDays, FileSize: cfg.LogMaxFileSize, TotalSize: cfg.LogMaxTotalSize})
@@ -142,11 +143,14 @@ func run(ctx context.Context, cfg config.Config, p *proxy.Proxy, settings *confi
 		if engine.Rootfs != "" && next.RuntimeImage == engine.Cfg.RuntimeImage {
 			prepared, err = images.Cached(next.RuntimeImage, engine.Digest)
 		} else {
-			log.Printf("preparing runtime image image=%s", next.RuntimeImage)
-			prepared, err = images.Prepare(op, next.RuntimeImage)
-			if err != nil && engine.Rootfs == "" && prior.ImageRef == next.RuntimeImage && prior.Digest != "" {
-				log.Printf("using cached runtime image after registry failure")
+			if engine.Rootfs == "" && prior.ImageRef == next.RuntimeImage && prior.Digest != "" {
 				prepared, err = images.Cached(next.RuntimeImage, prior.Digest)
+			}
+			if prepared.Rootfs == "" {
+				log.Printf("preparing runtime image image=%s", next.RuntimeImage)
+				prepared, err = images.Prepare(op, next.RuntimeImage)
+			} else {
+				log.Printf("using accepted cached runtime image image=%s", next.RuntimeImage)
 			}
 		}
 		if err != nil {

@@ -101,14 +101,17 @@ The root owns README.md, Dockerfile, compose.yaml, Makefile, go.mod, .gitignore 
 
 - easy-service supervises stateless HTTP workloads selected from Git, installed in private OCI filesystems and exposed on port 80.
 - README.md is the public configuration, deployment and lifecycle reference. Keep it aligned with implementation.
-- Run `make check` with Go 1.23 or later and Python 3: formatting, vet, race tests, `scripts/contract-test.sh` and Docker publication policy tests.
+- Run `make check` with Go 1.27.3 or later and Python 3: formatting, vet, race tests, `scripts/contract-test.sh` and Docker publication policy tests.
 - Cross-package tests may fake owned external boundaries; real OCI/runtime and Docker build checks require their documented tools and host prerequisites.
 - Compose uses Docker's default security policies. The supervisor runs as root inside Docker and drops each workload to a unique Linux UID with no_new_privs; PRoot 5.5 translates OCI paths without nested mounts or namespaces.
 - Docker packages the pinned, checksum-verified PRoot source for both amd64 and arm64; older Debian PRoot versions do not support modern filesystem calls.
+- Build the supervisor with Go 1.27.3 or a newer patched release on Debian 13 (trixie); keep PRoot and final stages on the same Debian release, include pkg-config for PRoot, and apply available Debian package upgrades in the final stage. Security rebuilds must refresh base images and bypass cached apt layers.
+- Build Skopeo and umoci from pinned, checksum-verified source with the same Go toolchain and explicit security dependency updates; preserve Skopeo's default policy and tool licenses. Scan bundled Go binaries as well as OS packages, since distro package scans can omit embedded Go vulnerabilities. Verify tool changes with real rootless OCI and runtime checks.
 - The same Docker binary starts the supervisor without arguments and provides `status`, `redeploy`, `restart`, `kill-draining`, `config` and `help` subcommands. Control stays on a private Unix socket under DATA_DIR.
 - Runtime images default to `debian:bookworm-slim`; use Skopeo's native Docker image-name handling for shorthand names.
 - Preserve image environment defaults and explicit APP_* overrides, reserving only PORT; HOME defaults to /root. Setup writes in HOME and /tmp stay on the private writable filesystem.
-- Accepted configuration and revision/image identity share one atomic record in CONFIG_DIR; pending changes never activate on restart. An unconfigured container keeps its control CLI available.
+- Accepted configuration, revision/image identity and the reusable sandbox identity share one atomic record in CONFIG_DIR; pending changes never activate on restart. An unconfigured container keeps its control CLI available.
+- Resume compatible accepted sandboxes and their reserved Linux users across application/supervisor restarts. Restore cached image identity before registry access and check Git after initial recovery. Fresh deployments retain separate writable filesystems/users; failed resumes use the existing fresh-deployment path. No extra configuration is required.
 - Apply through immutable candidate settings and the existing readiness/cutover/drain engine. Supervisor policy changes avoid app replacement. Urgent kill-draining bypasses a blocked drain and may force-stop only registered retired instances.
 - Logs live in LOG_DIR and survive instance cleanup, defaulting to thirty days, 10 MiB pages and 1 GiB combined. Short random instance IDs remain unique against live runtimes and retained logs.
 - Discard source archives and stale image/Git caches only after usable selection or return to the previously accepted deployment; preserve offline recovery inputs.
