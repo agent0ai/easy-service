@@ -95,14 +95,15 @@ type Engine struct {
 	// RuntimeContext owns sandbox process lifetime independently from polling,
 	// health-watch, and signal contexts. Production cancels it only after the
 	// proxy and active backend have drained during Engine.Shutdown.
-	RuntimeContext context.Context
-	mu             sync.Mutex
-	active         *Active
-	draining       map[uint64]*retirement
-	seq            uint64
-	Failures       chan uint64
-	MemoryExceeded chan uint64
-	MemoryInterval time.Duration
+	RuntimeContext       context.Context
+	mu                   sync.Mutex
+	active               *Active
+	draining             map[uint64]*retirement
+	seq                  uint64
+	Failures             chan uint64
+	MemoryExceeded       chan uint64
+	MemoryInterval       time.Duration
+	interruptedCandidate string
 }
 
 func (e *Engine) nextID() (string, error) {
@@ -178,16 +179,38 @@ func (e *Engine) deployWith(ctx, watchCtx context.Context, sel revision.Selectio
 	e.mu.Lock()
 	previous := e.active
 	serving := previous != nil && e.Proxy.Current() == previous.Backend && !previous.Instance.Exited()
+	candidateKey := resumeKey(sel.SHA, plan.Digest, plan.Cfg)
+	retryingInterrupted := e.interruptedCandidate == candidateKey
+	if expected == nil && !retryingInterrupted {
+		e.interruptedCandidate = ""
+	}
 	e.mu.Unlock()
-	if serving {
+	if serving && (expected != nil || !retryingInterrupted) {
+		parentCtx := ctx
 		opCtx, cancel := context.WithCancel(ctx)
 		defer cancel()
 		ctx = opCtx
+		servingFailed := make(chan struct{})
+		defer func() {
+			if committed || expected != nil || parentCtx.Err() != nil {
+				return
+			}
+			select {
+			case <-servingFailed:
+				// A crashing serving revision must not repeatedly cancel its repair.
+				e.mu.Lock()
+				e.interruptedCandidate = candidateKey
+				e.mu.Unlock()
+			default:
+			}
+		}()
 		go func() {
 			select {
 			case <-previous.Instance.Done():
+				close(servingFailed)
 				cancel()
 			case <-previous.failed:
+				close(servingFailed)
 				cancel()
 			case <-opCtx.Done():
 			}
@@ -264,6 +287,11 @@ func (e *Engine) deployWith(ctx, watchCtx context.Context, sel revision.Selectio
 		return err
 	}
 	committed = true
+	if expected == nil {
+		e.mu.Lock()
+		e.interruptedCandidate = ""
+		e.mu.Unlock()
+	}
 	if saved := e.Restore; saved != nil {
 		if saved.Sandbox != "" && saved.Sandbox != filepath.Base(candidate.BundlePath()) && filepath.Base(saved.Sandbox) == saved.Sandbox {
 			if err := state.RemoveSandbox(plan.Cfg.DataDir, filepath.Join(plan.Cfg.DataDir, "instances", saved.Sandbox)); err != nil {
@@ -847,6 +875,7 @@ func (c *Controller) Run(ctx context.Context) {
 			}
 			recovery = nil
 			if pending != nil {
+				pendingFailed = false
 				scheduleRetry(c.Cfg.HealthInterval)
 			}
 			continue
@@ -875,6 +904,9 @@ func (c *Controller) Run(ctx context.Context) {
 				continue
 			}
 			recovery = nil
+			if pending != nil {
+				pendingFailed = false
+			}
 		}
 	}
 }

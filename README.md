@@ -205,7 +205,9 @@ and WebSockets have up to `DRAIN_TIMEOUT` seconds (30 by default) to finish on
 the old version. Increase Docker's stop grace period when increasing this timeout.
 
 Crashes and failed health checks trigger one restart, followed by a fresh
-installation on another failure. Recovery keeps retrying. Application writes
+installation on another failure. Recovery keeps retrying the accepted revision;
+publish a fix or revert in Git if it is faulty. Pending repairs can finish even
+while the accepted revision repeatedly crashes. Application writes
 are temporary across redeployments; keep databases and durable files elsewhere.
 Restarting the outer container briefly interrupts service, then resumes the last
 accepted sandbox with its existing files and reserved user. It uses the accepted

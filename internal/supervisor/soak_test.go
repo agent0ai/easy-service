@@ -164,6 +164,12 @@ func TestDeploymentSoak(t *testing.T) {
 			t.Fatal(err)
 		default:
 		}
+		rt.mu.Lock()
+		retainedInstances := len(rt.instances)
+		rt.mu.Unlock()
+		if retainedInstances > 2 {
+			t.Fatalf("test runtime retains retired instances: %d", retainedInstances)
+		}
 		for _, name := range []string{"instances", "prepared", "deployments"} {
 			entries, err := os.ReadDir(filepath.Join(data, name))
 			// A rejected candidate may retain one prepared cache for retry.

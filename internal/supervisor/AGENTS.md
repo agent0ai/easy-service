@@ -8,7 +8,7 @@ Own the serialized deployment, cutover, drain and recovery engine.
 - `settings.go` owns apply classification, immutable candidate plans and policy publication; `settings_test.go` checks stage/apply/restart persistence, rollback, app-only SHA preservation, source/image changes and streaming.
 - `control.go` owns command execution through the engine, live status and the private Unix control socket; `control_test.go` checks commands through actual local Git, filesystems, sockets and HTTP with sandbox execution replaced.
 - `integration_test.go` uses real local Git/filesystem/HTTP boundaries with owned sandbox execution fakes.
-- `soak_test.go` owns opt-in deployment/traffic/resource stress verification.
+- `soak_test.go` owns opt-in deployment/traffic/resource stress verification. Its HTTP runtime fake drops retired instances so heap checks measure the engine rather than retained test servers.
 
 ## Local Contracts
 
@@ -24,11 +24,12 @@ Own the serialized deployment, cutover, drain and recovery engine.
 - Save the configured Git source URL on deployment and recovery so startup cannot reuse a revision from another repository sharing the data directory.
 - Preparation identity includes format version 3, full SHA, image digest, setup command and application environment. The version invalidates installations prepared under the previous runtime ownership model. Runtime-assigned ports and run-command-only changes reuse preparation.
 - Reject invalid revision selections before filesystem/preparation work.
-- Cancel candidate work if the serving instance exits or fails health; never route an exited/cancelled candidate.
+- The first serving-instance failure interrupts a candidate for active recovery. Retrying that same candidate's deployment inputs may finish despite another serving failure, so a crash loop cannot repeatedly cancel its repair. Memory replacements still cancel when their original instance fails. Never route an exited/cancelled candidate.
 - Memory pressure requests same-revision deployment through the same cutover/readiness/drain engine.
 - Retire watcher goroutines and stale generations; failed candidate retries cannot starve active recovery.
 - Recovery grants one restart of the writable installation, then fresh deployment; health success does not restore the restart allowance.
 - Coalesce polled updates without blocking and pace failed retries by the health interval.
+- Give a pending revision another attempt after successful active recovery; repeated crashes must not indefinitely reset its chance to deploy.
 - Preserve committed drain work across operation cancellation; stop the old process only after completion or the drain deadline.
 - Clean failed/private deployment filesystems and bound retained prepared caches; exclude every live setup filesystem from invalidation and collection until termination is confirmed.
 - Retain filesystems if a stop cannot be confirmed; recovery cannot reuse a live installation or consume the restart allowance before stopping succeeds.
@@ -57,6 +58,7 @@ Own the serialized deployment, cutover, drain and recovery engine.
 - TestKillAllRetiredInstancesKeepsActiveAndCleansFailedStops and TestControlActionsWithLocalGit verify urgent force-stop while redeploy is blocked by a live SSE stream.
 - Real OCI/PRoot execution under default Docker policies remains a separate check.
 - TestSavedSandboxResumeAndFreshFallback checks reuse of writable state, policy persistence, rejected/missing saved installations, failed state publication and changed environment/command/image inputs. Publication failure or cancelled initial recovery preserves accepted files.
+- TestRepeatedActiveFailuresDoNotStarvePendingRepair and TestRepairRetrySurvivesAnotherServingCrash cover repair deployment during crash loops while retaining the first interruption for active recovery.
 
 ## Child DOX Index
 

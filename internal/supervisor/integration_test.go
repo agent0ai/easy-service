@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -125,6 +126,7 @@ func (r *httpRuntime) launch(lifetime context.Context, id, bundle string) (Insta
 	i.server.Config.BaseContext = func(net.Listener) context.Context { return ctx }
 	i.server.Start()
 	r.mu.Lock()
+	r.instances = slices.DeleteFunc(r.instances, (*httpInstance).Exited)
 	r.instances = append(r.instances, i)
 	r.mu.Unlock()
 	go func() {

@@ -519,6 +519,98 @@ func TestBrokenPendingUpdateDoesNotStarveActiveRecovery(t *testing.T) {
 	}
 }
 
+func TestRepeatedActiveFailuresDoNotStarvePendingRepair(t *testing.T) {
+	e, r := engineFor(t, fakeHealth{})
+	a := revision.Selection{SHA: strings.Repeat("a", 40)}
+	b := revision.Selection{SHA: strings.Repeat("b", 40)}
+	if err := e.Deploy(context.Background(), a); err != nil {
+		t.Fatal(err)
+	}
+	r.failStarts = 1
+	e.Cfg.PollInterval, e.Cfg.HealthInterval = time.Hour, time.Hour
+	c := Controller{Cfg: e.Cfg, Selector: staticSelector{b}, Engine: e}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { c.Run(ctx); close(done) }()
+	defer func() { cancel(); <-done }()
+	waitFor(t, func() bool { r.mu.Lock(); defer r.mu.Unlock(); return r.starts >= 2 })
+	for n := 0; n < 2; n++ {
+		e.mu.Lock()
+		generation := e.active.generation
+		e.mu.Unlock()
+		e.Failures <- generation
+		waitFor(t, func() bool {
+			e.mu.Lock()
+			defer e.mu.Unlock()
+			return e.active.generation != generation
+		})
+	}
+	if e.Selected() != b.SHA {
+		t.Fatal("repeated failures of the serving revision starved the pending repair")
+	}
+}
+
+type gatedRepairHealth struct {
+	fakeHealth
+	gate    atomic.Bool
+	entered chan context.Context
+	release chan struct{}
+}
+
+func (h *gatedRepairHealth) Ready(ctx context.Context, _ string, _ health.Exited, _ time.Duration) error {
+	if !h.gate.Load() {
+		return nil
+	}
+	h.entered <- ctx
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-h.release:
+		return nil
+	}
+}
+
+func TestRepairRetrySurvivesAnotherServingCrash(t *testing.T) {
+	h := &gatedRepairHealth{entered: make(chan context.Context, 1), release: make(chan struct{})}
+	e, _ := engineFor(t, h)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	a := revision.Selection{SHA: strings.Repeat("a", 40)}
+	b := revision.Selection{SHA: strings.Repeat("b", 40)}
+	if err := e.Deploy(ctx, a); err != nil {
+		t.Fatal(err)
+	}
+	h.gate.Store(true)
+	result := make(chan error, 1)
+	go func() { result <- e.Deploy(ctx, b) }()
+	<-h.entered
+	_ = e.active.Instance.Stop(ctx)
+	if err := <-result; err == nil {
+		t.Fatal("initial serving failure did not interrupt the candidate for recovery")
+	}
+	h.gate.Store(false)
+	if err := e.Recover(ctx, e.active.generation); err != nil {
+		t.Fatal(err)
+	}
+	h.gate.Store(true)
+	go func() { result <- e.Deploy(ctx, b) }()
+	repairContext := <-h.entered
+	_ = e.active.Instance.Stop(ctx)
+	select {
+	case <-repairContext.Done():
+		<-result
+		t.Fatal("another serving crash cancelled the repair again")
+	case <-time.After(100 * time.Millisecond):
+	}
+	close(h.release)
+	if err := <-result; err != nil {
+		t.Fatal(err)
+	}
+	if e.Selected() != b.SHA || e.Proxy.Current() == nil {
+		t.Fatal("repair did not restore service")
+	}
+}
+
 func TestNewerRevisionSupersedesBrokenPendingSelection(t *testing.T) {
 	e, r := engineFor(t, fakeHealth{})
 	r.failStarts = 1
