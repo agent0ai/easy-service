@@ -15,11 +15,13 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"syscall"
 	"testing"
 	"time"
+	"unsafe"
 )
 
 var heldMemory []byte
@@ -61,6 +63,23 @@ func fakeRuntime() {
 	status, _ := os.ReadFile("/proc/self/status")
 	if !strings.Contains(string(status), "NoNewPrivs:\t1") {
 		panic("privilege escalation was not disabled")
+	}
+	if runtime.GOARCH == "amd64" || runtime.GOARCH == "arm64" {
+		if !strings.Contains(string(status), "Seccomp:\t2") {
+			panic("seccomp filter was not installed")
+		}
+		// openat2 and io_uring_setup must return ENOSYS so runtimes fall back cleanly.
+		var how [24]byte
+		if _, _, errno := syscall.Syscall6(sysOpenat2, uintptr(^uint(99)), uintptr(unsafe.Pointer(&how[0])), uintptr(unsafe.Pointer(&how[0])), uintptr(len(how)), 0, 0); errno != syscall.ENOSYS {
+			panic(fmt.Sprintf("openat2 did not return ENOSYS: %v", errno))
+		}
+		var params [120]byte
+		if _, _, errno := syscall.Syscall(sysIOUringSetup, 1, uintptr(unsafe.Pointer(&params[0])), 0); errno != syscall.ENOSYS {
+			panic(fmt.Sprintf("io_uring_setup did not return ENOSYS: %v", errno))
+		}
+	}
+	if prootTmp := os.Getenv("PROOT_TMP_DIR"); !strings.HasPrefix(prootTmp, "/run/easy-service/tmp/") || len(prootTmp) > 40 {
+		panic(fmt.Sprintf("unexpected PROOT_TMP_DIR: %q", prootTmp))
 	}
 	if os.Getenv("SUPERVISOR_ONLY_TEST") != "" {
 		panic("supervisor environment leaked")
@@ -388,6 +407,9 @@ func TestNativeRuntimeOwnsAllProcessesAndFiles(t *testing.T) {
 	defer cancel()
 	if err := old.Stop(ctx); err != nil || !old.Exited() {
 		t.Fatalf("whole-instance forced stop: %v", err)
+	}
+	if _, err := os.Stat(old.owner.TempDir()); !os.IsNotExist(err) {
+		t.Fatalf("PRoot temp dir not removed after stop: %v", err)
 	}
 	sample, err := process.SampleUser(old.owner.UID)
 	if err != nil || len(sample.PIDs) != 0 {

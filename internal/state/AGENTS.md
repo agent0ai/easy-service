@@ -4,7 +4,7 @@ Own persistent active state and reconciliation after supervisor restart.
 
 ## Ownership
 
-- `runtime.go` owns root-only UID leases under /run/easy-service/users and their orphan cleanup; workload users cannot forge or release ownership records.
+- `runtime.go` owns root-only UID leases under `/run/easy-service/users`, per-UID PRoot scratch directories under `/run/easy-service/tmp/<uid>`, and their orphan cleanup; workload users cannot forge or release ownership records.
 - `sandbox.go` owns protected per-filesystem ownership records, stopped-user reacquisition and filesystem deletion before UID release.
 - `state.go` owns state load/save/clear, atomic metadata publication, shared cleanup bounds and stale runtime/filesystem reconciliation.
 - The command chooses recovery inputs; the engine owns state transitions.

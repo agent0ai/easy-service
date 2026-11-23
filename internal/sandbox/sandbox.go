@@ -303,6 +303,7 @@ func (r Runtime) start(ctx context.Context, id, bundle, command string, env []st
 	started := false
 	defer func() {
 		if !started {
+			_ = owner.RemoveTempDir()
 			_ = os.RemoveAll(owner.Root)
 		}
 	}()
@@ -328,8 +329,8 @@ func (r Runtime) start(ctx context.Context, id, bundle, command string, env []st
 	if err := os.Chmod(tmp, 0777|os.ModeSticky); err != nil {
 		return nil, err
 	}
-	traceTmp := filepath.Join(owner.Root, "tmp")
-	if err := os.Mkdir(traceTmp, 0700); err != nil {
+	traceTmp, err := owner.PrepareTempDir()
+	if err != nil {
 		return nil, err
 	}
 	uid := strconv.FormatUint(uint64(owner.UID), 10)
@@ -339,9 +340,6 @@ func (r Runtime) start(ctx context.Context, id, bundle, command string, env []st
 			return nil, fmt.Errorf("own instance filesystem: %w: %s", err, b)
 		}
 		log.Printf("sandbox ownership initialized instance=%s duration=%s", id, time.Since(began))
-	}
-	if err := os.Chown(traceTmp, int(owner.UID), int(owner.UID)); err != nil {
-		return nil, err
 	}
 	if err := os.Chmod(rootfs, 0700); err != nil {
 		return nil, err
@@ -425,6 +423,7 @@ func (r Runtime) start(ctx context.Context, id, bundle, command string, env []st
 			log.Printf("instance process cleanup blocked instance=%s error=%v", logID, err)
 			time.Sleep(time.Second)
 		}
+		_ = owner.RemoveTempDir()
 		close(i.done)
 		live.Delete(owner.Root)
 		if r.Logs != nil {

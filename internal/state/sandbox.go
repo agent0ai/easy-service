@@ -79,11 +79,8 @@ func AcquireSandboxOwner(data, id, bundle string) (RuntimeOwner, bool, error) {
 	if len(sample.PIDs) != 0 {
 		return owner, false, fmt.Errorf("sandbox user is still running")
 	}
-	if err = os.MkdirAll(runtimeOwners, 0700); err != nil {
+	if err = ensureRuntimeDirs(); err != nil {
 		return owner, false, err
-	}
-	if st, err := os.Lstat(runtimeOwners); err != nil || !st.IsDir() || st.Mode().Perm() != 0700 || st.Sys().(*syscall.Stat_t).Uid != 0 {
-		return owner, false, fmt.Errorf("untrusted runtime owner directory")
 	}
 	if err = os.Mkdir(owner.claim(), 0700); os.IsExist(err) {
 		if st, err := os.Lstat(owner.claim()); err != nil || !st.IsDir() || st.Mode().Perm() != 0700 || st.Sys().(*syscall.Stat_t).Uid != 0 {

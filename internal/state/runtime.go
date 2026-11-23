@@ -15,7 +15,11 @@ import (
 	"github.com/example/easy-service/internal/process"
 )
 
-const runtimeOwners = "/run/easy-service/users"
+const (
+	runtimeBase   = "/run/easy-service"
+	runtimeOwners = "/run/easy-service/users"
+	runtimeTemp   = "/run/easy-service/tmp"
+)
 
 // RuntimeOwner is a root-owned UID lease. Workloads cannot create, change or
 // release leases; a UID is never reused while its processes remain alive.
@@ -42,12 +46,8 @@ func newRuntimeOwner(data, id, bundle string) (RuntimeOwner, error) {
 	if err := os.MkdirAll(owner.Root, 0711); err != nil {
 		return owner, err
 	}
-	if err := os.MkdirAll(runtimeOwners, 0700); err != nil {
+	if err := ensureRuntimeDirs(); err != nil {
 		return owner, err
-	}
-	st, err := os.Lstat(runtimeOwners)
-	if err != nil || !st.IsDir() || st.Mode().Perm() != 0700 || st.Sys().(*syscall.Stat_t).Uid != 0 {
-		return owner, fmt.Errorf("runtime owner directory must be private and root-owned")
 	}
 	var random [4]byte
 	if _, err := rand.Read(random[:]); err != nil {
@@ -82,6 +82,69 @@ func newRuntimeOwner(data, id, bundle string) (RuntimeOwner, error) {
 	return owner, fmt.Errorf("no unused workload UID available")
 }
 
+func ensureRuntimeDirs() error {
+	if err := os.MkdirAll(runtimeBase, 0711); err != nil {
+		return err
+	}
+	st, err := os.Lstat(runtimeBase)
+	if err != nil || !st.IsDir() || st.Sys().(*syscall.Stat_t).Uid != 0 {
+		return fmt.Errorf("runtime base directory must be root-owned")
+	}
+	if err := os.Chmod(runtimeBase, 0711); err != nil {
+		return err
+	}
+	if err := os.MkdirAll(runtimeOwners, 0700); err != nil {
+		return err
+	}
+	st, err = os.Lstat(runtimeOwners)
+	if err != nil || !st.IsDir() || st.Mode().Perm() != 0700 || st.Sys().(*syscall.Stat_t).Uid != 0 {
+		return fmt.Errorf("runtime owner directory must be private and root-owned")
+	}
+	return nil
+}
+
+// TempDir returns the short per-UID scratch directory for PRoot under /run.
+func (o RuntimeOwner) TempDir() string {
+	return filepath.Join(runtimeTemp, strconv.FormatUint(uint64(o.UID), 10))
+}
+
+// PrepareTempDir creates a fresh, private, UID-owned short scratch directory
+// under /run so PRoot's internal paths stay well below Unix socket limits.
+func (o RuntimeOwner) PrepareTempDir() (string, error) {
+	if os.Geteuid() != 0 || o.UID < process.MinWorkloadUID || o.UID >= 60000 {
+		return "", fmt.Errorf("invalid runtime owner")
+	}
+	if err := ensureRuntimeDirs(); err != nil {
+		return "", err
+	}
+	if err := os.MkdirAll(runtimeTemp, 0711); err != nil {
+		return "", err
+	}
+	st, err := os.Lstat(runtimeTemp)
+	if err != nil || !st.IsDir() || st.Sys().(*syscall.Stat_t).Uid != 0 {
+		return "", fmt.Errorf("runtime temp directory must be root-owned")
+	}
+	if err := os.Chmod(runtimeTemp, 0711); err != nil {
+		return "", err
+	}
+	dir := o.TempDir()
+	if err := os.RemoveAll(dir); err != nil {
+		return "", err
+	}
+	if err := os.Mkdir(dir, 0700); err != nil {
+		return "", err
+	}
+	if err := os.Chown(dir, int(o.UID), int(o.UID)); err != nil {
+		_ = os.RemoveAll(dir)
+		return "", err
+	}
+	return dir, nil
+}
+
+func (o RuntimeOwner) RemoveTempDir() error {
+	return os.RemoveAll(o.TempDir())
+}
+
 func (o RuntimeOwner) claim() string {
 	return filepath.Join(runtimeOwners, strconv.FormatUint(uint64(o.UID), 10))
 }
@@ -105,6 +168,7 @@ func (o RuntimeOwner) Release() error {
 	if len(sample.PIDs) != 0 {
 		return fmt.Errorf("cannot release a running instance UID")
 	}
+	_ = o.RemoveTempDir()
 	return os.RemoveAll(o.claim())
 }
 
@@ -165,6 +229,7 @@ func reconcileRuntimeOwners(data string) error {
 		if err != nil {
 			return fmt.Errorf("stop orphan instance: %w", err)
 		}
+		_ = owner.RemoveTempDir()
 		// Writable sandboxes reserve their UID even while stopped.
 		if owner.Bundle != "" {
 			if saved, err := SandboxOwner(data, owner.Bundle); err == nil && saved.UID == owner.UID {
