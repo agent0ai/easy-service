@@ -515,7 +515,11 @@ func preparedID(sha, digest string, cfg config.Config) string {
 }
 
 func resumeKey(sha, digest string, cfg config.Config) string {
-	b, _ := json.Marshal([]string{preparedID(sha, digest, cfg), cfg.GitURL, cfg.RuntimeImage, cfg.RunCommand, cfg.HealthPath})
+	inputs := []string{preparedID(sha, digest, cfg), cfg.GitURL, cfg.RuntimeImage, cfg.RunCommand, cfg.HealthPath}
+	for _, mount := range cfg.SandboxMounts {
+		inputs = append(inputs, mount.Source, mount.Destination)
+	}
+	b, _ := json.Marshal(inputs)
 	h := sha256.Sum256(b)
 	return hex.EncodeToString(h[:])
 }

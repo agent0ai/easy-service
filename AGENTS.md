@@ -99,7 +99,7 @@ The root owns README.md, Dockerfile, compose.yaml, Makefile, go.mod, .gitignore 
 
 ## Project Context and Verification
 
-- easy-service supervises stateless HTTP workloads selected from Git, installed in private OCI filesystems and exposed on port 80.
+- easy-service supervises HTTP workloads selected from Git, installed in private OCI filesystems and exposed on port 80. SANDBOX_MOUNTS provides opt-in durable app storage.
 - README.md is the public configuration, deployment and lifecycle reference. Keep it aligned with implementation.
 - Run `make check` with Go 1.27.3 or later and Python 3: formatting, vet, race tests, `scripts/contract-test.sh` and Docker publication policy tests.
 - Cross-package tests may fake owned external boundaries; real OCI/runtime and Docker build checks require their documented tools and host prerequisites.

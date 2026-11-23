@@ -32,6 +32,16 @@ type settingsRuntime struct {
 	env    []string
 }
 
+func TestMountsAffectResumeButReusePreparation(t *testing.T) {
+	cfg := config.Config{}
+	prepared := preparedID("revision", "digest", cfg)
+	resume := resumeKey("revision", "digest", cfg)
+	cfg.SandboxMounts = []config.Mount{{Source: "/outer", Destination: "/inner"}}
+	if resumeKey("revision", "digest", cfg) == resume || preparedID("revision", "digest", cfg) != prepared {
+		t.Fatal("mount changes must replace the sandbox and reuse setup")
+	}
+}
+
 func (r *settingsRuntime) Start(op, lifetime context.Context, id, base, prepared, command string, env []string) (Instance, error) {
 	r.mu.Lock()
 	r.starts++

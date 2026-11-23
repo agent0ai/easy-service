@@ -20,6 +20,7 @@ Own OCI filesystem execution through PRoot, Linux user isolation and whole-insta
 - Record ownership only after the first complete chown. Reused sandboxes skip the rootfs copy and ownership walk; each launch still gets fresh runtime metadata, DNS, tracer storage and PORT. Log copy/initial ownership durations without configuration values.
 - DATA_DIR and managed instance parents permit traversal; rootfs and per-UID PRoot scratch storage (`/run/easy-service/tmp/<uid>`, kept short for Linux Unix-socket path limits and removed on exit/reconcile) belong only to the leased UID. Root-owned launch settings stay private. Custom DATA_DIR ancestors must permit directory traversal.
 - Supply an owned read-only resolver copy using PRoot path translation; guest resolver symlinks cannot redirect host writes.
+- Bind only selected SANDBOX_MOUNTS on app launch and restart. Require existing canonical source directories owned by group 19000 with setgid and group rwx. Keep each UID and its primary group distinct. Set supplementary group 19000 and umask 0002 for apps with mounts, verify access as the workload UID and verify the guest sees each bound directory before executing. Setup stays private. Preserve host directory ownership and contents.
 - Setup honors SETUP_TIMEOUT and confirms termination before failed preparation is removed. Never reuse or validate a prepared filesystem still owned by live setup. Filesystem cancellation remains separate from app lifetime.
 - Stop signals every process owned by the leased UID, including detached/reparented descendants, then escalates to KILL at the deadline. Cancellation also stops the whole UID; signal the UID before terminating the tracer. Confirm all live UID processes exited before Done or filesystem cleanup. Retain filesystem reservations after exit; state.RemoveSandbox deletes files before releasing them. Never reuse a live UID or signal completed instances.
 - Close Done as a broadcast after process/output/descendant completion and before console reporting or file-writer retirement can block; preserve exit errors across repeated Wait calls.
@@ -37,6 +38,7 @@ Own OCI filesystem execution through PRoot, Linux user isolation and whole-insta
 - `go test -race ./internal/sandbox` checks overlapping ports/UIDs, private file ownership, privilege restrictions, detached-child CPU/RAM, whole-instance kill, peer survival and retained failure output.
 - Repeated restart coverage verifies unchanged filesystem inodes/ctime and UID, proving that reuse does not copy/reown retained files.
 - TestCheckoutOnlyPreparationAndPrivateCopies checks checkout-only storage, isolated candidate writes and safe replacement of an OCI /app symlink.
+- TestMountSourceAndDestinationValidation checks group permissions, protected aliases and source/destination symlinks.
 - Actual OCI/PRoot checks belong to cmd/easy-service/real_test.go; fakes do not verify OCI syscall compatibility.
 
 ## Child DOX Index

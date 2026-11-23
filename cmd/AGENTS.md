@@ -15,6 +15,7 @@ Own the supervisor executable and its process lifetime.
 
 - Fail startup if root/PRoot prerequisites or restart reconciliation fail.
 - Runtime adapters pass the selected cached image root, commands and environment to the runtime owner; sandbox owns PORT allocation and shared-network endpoints.
+- Check configured mount sources before preparing the image and pass the immutable mount list to the candidate runtime.
 - Keep runtime process lifetime separate from polling/signal cancellation. On shutdown, stop accepting HTTP requests while the engine drains/stops instances; engine completion bounds frontend shutdown, including slow clients. Honor configured drain and bounded sandbox-stop time.
 - Propagate fatal owner errors to the process; keep transient image/revision failures retryable through their owning subsystem.
 - Use `State.Recoverable` for prior revision recovery; both configured Git source and runtime image must match. Cached image recovery depends only on the runtime image.

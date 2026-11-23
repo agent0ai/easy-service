@@ -165,6 +165,7 @@ All of these are optional. Times are in seconds.
 | `SETUP_TIMEOUT` | `900` | Maximum setup time. |
 | `DRAIN_TIMEOUT` | `30` | Time allowed for existing requests and streams to finish before stopping an old instance. |
 | `DATA_DIR` | `/data` | Where the supervisor stores its Git, image, and installation cache. |
+| `SANDBOX_MOUNTS` | empty | Comma-separated data directories to expose to the running app, as `/path` or `/source:/destination`. |
 | `CONFIG_DIR` | `/config` | Accepted settings and pending overrides. |
 | `LOG_DIR` | `/logs` | Application stdout and stderr from all instances. |
 | `LOG_RETENTION_DAYS` | `30` | Days of application logs to retain. |
@@ -215,6 +216,42 @@ must be writable by root. Directory locations are chosen through Docker's
 `DATA_DIR`, `CONFIG_DIR` and `LOG_DIR` settings when the container starts;
 the other settings can be changed through the CLI.
 
+### Application data
+
+Mount storage into the outer container with Docker, then opt in to exposing
+each directory to the app. For example, add these entries to the easy-service
+service in Compose.
+
+```yaml
+volumes:
+  - ./database:/mounted-db
+  - ./uploads:/srv/uploads
+environment:
+  SANDBOX_MOUNTS: /mounted-db:/var/lib/myapp,/srv/uploads
+  APP_DB_PATH: /var/lib/myapp/app.db
+```
+
+The source is an existing absolute directory inside the outer container.
+A single path uses the same location inside the sandbox. Use clean directory
+paths without symlinks, and distinct, non-overlapping destinations. Supervisor
+state and runtime paths are protected. Setup commands use the private image
+filesystem. Apply changes with `config set SANDBOX_MOUNTS=...` and
+`config apply --wait`.
+
+Prepare each source directory with numeric group `19000` and mode `2770`, for
+example `sudo chgrp 19000 ./database ./uploads` and
+`sudo chmod 2770 ./database ./uploads`. Parent directories inside the container
+must permit traversal. App instances with mounts receive group `19000` and umask
+`0002`. Setgid directories preserve the group for new files. Easy-service
+leaves the permissions and ownership of mounted contents to you.
+
+For SQLite, mount the entire directory. Create a new database file with group
+`19000` and mode `0660` before the app opens it, or grant the same access to the
+existing database and sidecar files. Use local storage with SQLite-compatible
+locking. The candidate and draining instance can use the same database during
+deployment. Keep schema changes compatible with both versions during that
+overlap, and take backups independently of deployment.
+
 ## What to expect
 
 A healthy update starts the new version before switching traffic. Failed
@@ -225,8 +262,9 @@ the old version. Increase Docker's stop grace period when increasing this timeou
 Crashes and failed health checks trigger one restart, followed by a fresh
 installation on another failure. Recovery keeps retrying the accepted revision;
 publish a fix or revert in Git if it is faulty. Pending repairs can finish even
-while the accepted revision repeatedly crashes. Application writes
-are temporary across redeployments; keep databases and durable files elsewhere.
+while the accepted revision repeatedly crashes. Writes to the private
+filesystem are temporary across redeployments. Store durable app data in
+`SANDBOX_MOUNTS` or an external service.
 Restarting the outer container briefly interrupts service, then resumes the last
 accepted sandbox with its existing files and reserved user. It uses the accepted
 cached image digest before contacting the registry and checks Git after recovery.

@@ -92,6 +92,7 @@ type launchConfig struct {
 	UID                                       uint32
 	Rootfs, DNS, Temp, Proot, Binary, Command string
 	Env                                       []string
+	Mounts                                    []launchMount
 }
 
 // Child runs only the internal re-execution path. The descriptor contains app
@@ -121,6 +122,12 @@ func Child(args []string) (bool, error) {
 		if err != nil || !owned {
 			return true, fmt.Errorf("workload privileges were not dropped")
 		}
+		for _, mount := range config.Mounts {
+			var stat syscall.Stat_t
+			if err := syscall.Stat(mount.Destination, &stat); err != nil || stat.Dev != mount.Device || stat.Ino != mount.Inode {
+				return true, fmt.Errorf("SANDBOX_MOUNTS destination %q did not bind to its source directory", mount.Destination)
+			}
+		}
 		if err := os.Chdir("/app"); err != nil {
 			return true, err
 		}
@@ -132,7 +139,12 @@ func Child(args []string) (bool, error) {
 	if _, err := file.Seek(0, 0); err != nil {
 		return true, err
 	}
-	if err := syscall.Setgroups(nil); err != nil {
+	var groups []int
+	if len(config.Mounts) != 0 {
+		groups = []int{dataGroup}
+		syscall.Umask(0002)
+	}
+	if err := syscall.Setgroups(groups); err != nil {
 		return true, err
 	}
 	if err := syscall.Setgid(int(config.UID)); err != nil {
@@ -152,7 +164,16 @@ func Child(args []string) (bool, error) {
 	argv := []string{config.Proot, "-0", "-r", config.Rootfs,
 		"-b", "/proc", "-b", "/dev",
 		"-b", config.DNS + ":/etc/resolv.conf!",
-		"-b", config.Binary + ":/.easy-service!",
-		"-w", "/app", "/.easy-service", "__runtime", "guest"}
+		"-b", config.Binary + ":/.easy-service!"}
+	for _, mount := range config.Mounts {
+		if _, err := mountSource(mount.Source); err != nil {
+			return true, err
+		}
+		if err := syscall.Access(mount.Source, 7); err != nil {
+			return true, fmt.Errorf("SANDBOX_MOUNTS source %q is inaccessible to the workload: %w", mount.Source, err)
+		}
+		argv = append(argv, "-b", mount.Source+":"+mount.Destination+"!")
+	}
+	argv = append(argv, "-w", "/app", "/.easy-service", "__runtime", "guest")
 	return true, syscall.Exec(config.Proot, argv, []string{"PATH=/usr/bin:/bin", "PROOT_TMP_DIR=" + config.Temp})
 }

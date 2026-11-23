@@ -138,6 +138,9 @@ func run(ctx context.Context, cfg config.Config, p *proxy.Proxy, settings *confi
 	}
 	images := imagepkg.Manager{Data: cfg.DataDir, Runner: process.Runner{}}
 	controller.Configure = func(op context.Context, next config.Config) (supervisor.Deployment, supervisor.Selector, error) {
+		if err := sandbox.ValidateMounts(next); err != nil {
+			return supervisor.Deployment{}, nil, err
+		}
 		var prepared imagepkg.Prepared
 		var err error
 		if engine.Rootfs != "" && next.RuntimeImage == engine.Cfg.RuntimeImage {
@@ -157,7 +160,7 @@ func run(ctx context.Context, cfg config.Config, p *proxy.Proxy, settings *confi
 			return supervisor.Deployment{}, nil, err
 		}
 		git := revision.New(next.GitURL, next.GitToken, next.DataDir)
-		runtime := &runtimeAdapter{sandbox.Runtime{Data: next.DataDir, ImageEnv: prepared.Env, Logs: capture, SetupTimeout: next.SetupTimeout, Stdout: os.Stdout, Stderr: os.Stderr}}
+		runtime := &runtimeAdapter{sandbox.Runtime{Data: next.DataDir, ImageEnv: prepared.Env, Mounts: next.SandboxMounts, Logs: capture, SetupTimeout: next.SetupTimeout, Stdout: os.Stdout, Stderr: os.Stderr}}
 		return supervisor.Deployment{Cfg: next, Runtime: runtime, Checkout: git, Health: health.New(next.HealthInterval, next.HealthPath), Rootfs: prepared.Rootfs, Digest: prepared.Digest}, git, nil
 	}
 	engine.CollectCaches = func(plan supervisor.Deployment) {

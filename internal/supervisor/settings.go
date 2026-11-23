@@ -72,7 +72,7 @@ func (c *Controller) apply(ctx, watchCtx context.Context, overrides map[string]s
 			replace = true
 		case "GIT_TOKEN":
 			selectSource = true
-		case "RUNTIME_IMAGE", "SETUP_COMMAND", "RUN_COMMAND", "HEALTH_PATH":
+		case "RUNTIME_IMAGE", "SETUP_COMMAND", "RUN_COMMAND", "HEALTH_PATH", "SANDBOX_MOUNTS":
 			replace = true
 		default:
 			if strings.HasPrefix(name, "APP_") {

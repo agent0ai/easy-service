@@ -18,6 +18,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/example/easy-service/internal/config"
 	"github.com/example/easy-service/internal/logs"
 	"github.com/example/easy-service/internal/process"
 	"github.com/example/easy-service/internal/state"
@@ -40,6 +41,7 @@ type Instance struct {
 type Runtime struct {
 	Data           string
 	ImageEnv       []string
+	Mounts         []config.Mount
 	Logs           *logs.Manager
 	SetupTimeout   time.Duration
 	Stdout, Stderr io.Writer
@@ -107,7 +109,9 @@ func (r Runtime) Prepare(ctx context.Context, id, base, checkout, setup string, 
 		}
 		op, cancel := context.WithTimeout(ctx, timeout)
 		defer cancel()
-		i, e := r.start(op, "setup-"+id, dir, setup, env)
+		setupRuntime := r
+		setupRuntime.Mounts = nil
+		i, e := setupRuntime.start(op, "setup-"+id, dir, setup, env)
 		if e != nil {
 			return "", e
 		}
@@ -367,7 +371,11 @@ func (r Runtime) start(ctx context.Context, id, bundle, command string, env []st
 	if err != nil {
 		return nil, err
 	}
-	launch := launchConfig{UID: owner.UID, Rootfs: rootfs, DNS: dns, Temp: traceTmp, Proot: proot, Binary: binary, Command: command, Env: workloadEnv(r.ImageEnv, env, port)}
+	mounts, err := launchMounts(rootfs, r.Mounts)
+	if err != nil {
+		return nil, err
+	}
+	launch := launchConfig{UID: owner.UID, Rootfs: rootfs, DNS: dns, Temp: traceTmp, Proot: proot, Binary: binary, Command: command, Env: workloadEnv(r.ImageEnv, env, port), Mounts: mounts}
 	body, err := json.Marshal(launch)
 	if err != nil {
 		return nil, err

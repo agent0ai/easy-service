@@ -23,6 +23,7 @@ type Config struct {
 	HealthFailures                                              int
 	ServiceMemoryLimit                                          uint64
 	AppEnv                                                      []string
+	SandboxMounts                                               []Mount
 }
 
 // Defaults are also the public configuration surface; APP_* values are explicit workload inputs.
@@ -30,7 +31,8 @@ var Defaults = map[string]string{
 	"GIT_URL": "", "GIT_TOKEN": "", "GIT_BRANCH": "main", "UPDATE_METHOD": "commit", "UPDATE_PATTERN": "*",
 	"RUNTIME_IMAGE": "debian:bookworm-slim", "SETUP_COMMAND": "", "RUN_COMMAND": "", "HEALTH_PATH": "/",
 	"DATA_DIR": "/data", "CONFIG_DIR": "/config", "LOG_DIR": "/logs",
-	"POLL_INTERVAL": "300", "STARTUP_TIMEOUT": "60", "HEALTH_INTERVAL": "10", "HEALTH_FAILURES": "3",
+	"SANDBOX_MOUNTS": "",
+	"POLL_INTERVAL":  "300", "STARTUP_TIMEOUT": "60", "HEALTH_INTERVAL": "10", "HEALTH_FAILURES": "3",
 	"SERVICE_MEMORY_LIMIT": "512M", "DRAIN_TIMEOUT": "30", "SETUP_TIMEOUT": "900",
 	"LOG_RETENTION_DAYS": "30", "LOG_MAX_FILE_SIZE": "10M", "LOG_MAX_TOTAL_SIZE": "1G",
 }
@@ -122,6 +124,9 @@ func Parse(values map[string]string, required bool) (Config, error) {
 	}
 	if statePathsOverlap(c.DataDir, c.ConfigDir) || statePathsOverlap(c.DataDir, c.LogDir) || statePathsOverlap(c.ConfigDir, c.LogDir) {
 		return c, fmt.Errorf("DATA_DIR, CONFIG_DIR and LOG_DIR must be separate directories")
+	}
+	if c.SandboxMounts, err = parseMounts(get("SANDBOX_MOUNTS"), c.DataDir, c.ConfigDir, c.LogDir); err != nil {
+		return c, err
 	}
 
 	if c.PollInterval, err = duration("POLL_INTERVAL", 300); err != nil {
