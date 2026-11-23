@@ -143,7 +143,7 @@ func (m *Manager) Select(ctx context.Context, method, branch, pattern string) (S
 		s, e := m.Run(op, m.Mirror, "rev-parse", "refs/remotes/origin/"+branch+"^{commit}")
 		return Selection{SHA: s}, e
 	case "tag":
-		return m.tag(op, pattern)
+		return m.tag(op, branch, pattern)
 	case "release":
 		return m.release(op, pattern)
 	}
@@ -172,8 +172,12 @@ func Match(pattern, name string) bool { // whole-string wildcard
 	}
 	return pi == len(pattern)
 }
-func (m *Manager) tag(ctx context.Context, p string) (Selection, error) {
-	out, e := m.Run(ctx, m.Mirror, "for-each-ref", "--sort=-refname", "--sort=-creatordate", "--format=%(refname:strip=2)", "refs/tags")
+func (m *Manager) tag(ctx context.Context, branch, p string) (Selection, error) {
+	tip, e := m.Run(ctx, m.Mirror, "show-ref", "--verify", "--hash", "refs/remotes/origin/"+branch)
+	if e != nil {
+		return Selection{}, e
+	}
+	out, e := m.Run(ctx, m.Mirror, "for-each-ref", "--merged="+tip, "--sort=-refname", "--sort=-creatordate", "--format=%(refname:strip=2)", "refs/tags")
 	if e != nil {
 		return Selection{}, e
 	}

@@ -135,12 +135,12 @@ func TestCommitTagAndExactCleanCheckout(t *testing.T) {
 		}
 		return run(ctx, dir, args...)
 	}
-	tag, e := m.Select(context.Background(), "tag", "", "v*")
+	tag, e := m.Select(context.Background(), "tag", "main", "v*")
 	if e != nil || tag.SHA != commit.SHA {
 		t.Fatalf("tag=%+v err=%v", tag, e)
 	}
-	if resolveCalls != 2 {
-		t.Fatalf("tag selection resolved %d objects instead of skipping the invalid newest and resolving the winner", resolveCalls)
+	if resolveCalls != 1 {
+		t.Fatalf("tag selection resolved %d objects instead of just the reachable winner", resolveCalls)
 	}
 	dst := filepath.Join(root, "checkout")
 	if e = m.Checkout(context.Background(), commit.SHA, dst); e != nil {
@@ -157,12 +157,51 @@ func TestCommitTagAndExactCleanCheckout(t *testing.T) {
 
 func gitTest(t *testing.T, dir string, args ...string) {
 	t.Helper()
+	gitTestAt(t, dir, "2025-01-01T00:00:00Z", args...)
+}
+
+func gitTestAt(t *testing.T, dir, date string, args ...string) {
+	t.Helper()
 	c := exec.Command("git", args...)
 	c.Dir = dir
 	(&Manager{}).gitEnv(c)
-	c.Env = append(c.Env, "GIT_AUTHOR_DATE=2025-01-01T00:00:00Z", "GIT_COMMITTER_DATE=2025-01-01T00:00:00Z")
+	c.Env = append(c.Env, "GIT_AUTHOR_DATE="+date, "GIT_COMMITTER_DATE="+date)
 	if b, e := c.CombinedOutput(); e != nil {
 		t.Fatalf("git %v: %v: %s", args, e, b)
+	}
+}
+
+func TestTagSelectionFollowsBranchAncestry(t *testing.T) {
+	dir := localRepository(t, "base")
+	manager := New(dir, "", t.TempDir())
+	selectSHA := func(method, branch, pattern string) string {
+		t.Helper()
+		selected, err := manager.Select(context.Background(), method, branch, pattern)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return selected.SHA
+	}
+	gitTest(t, dir, "branch", "test")
+	gitTest(t, dir, "commit", "--allow-empty", "-m", "main only")
+	gitTest(t, dir, "tag", "v2-main")
+	mainSHA := selectSHA("commit", "main", "*")
+	gitTest(t, dir, "checkout", "test")
+	gitTest(t, dir, "commit", "--allow-empty", "-m", "test only")
+	gitTestAt(t, dir, "2025-01-02T00:00:00Z", "tag", "-a", "v1-test", "-m", "test")
+	testSHA := selectSHA("commit", "test", "*")
+	if selectSHA("tag", "main", "v*") != mainSHA || selectSHA("tag", "test", "v*") != testSHA {
+		t.Fatal("divergent branches did not select their own tagged commits")
+	}
+	for _, pair := range [][2]string{{"main", "*-test"}, {"missing", "v*"}} {
+		if selected, err := manager.Select(context.Background(), "tag", pair[0], pair[1]); err == nil || selected.SHA != "" {
+			t.Fatalf("%v: selection=%+v err=%v", pair, selected, err)
+		}
+	}
+	gitTest(t, dir, "checkout", "main")
+	gitTest(t, dir, "merge", "--no-edit", "test")
+	if got := selectSHA("tag", "main", "v*"); got != testSHA {
+		t.Fatalf("after merge got %s, want tagged parent %s", got, testSHA)
 	}
 }
 

@@ -154,7 +154,7 @@ All of these are optional. Times are in seconds.
 | Variable | Default | What it does |
 |---|---|---|
 | `SERVICE_MEMORY_LIMIT` | `512M` | Replace the running service when its memory exceeds this soft threshold. Set `0` or empty to disable. |
-| `GIT_BRANCH` | `main` | Branch to watch. |
+| `GIT_BRANCH` | `main` | Branch to watch in `commit` and `tag` modes. Ignored in GitHub `release` mode. |
 | `UPDATE_METHOD` | `commit` | Deploy by `commit`, `tag`, or GitHub `release`. |
 | `UPDATE_PATTERN` | `*` | Tag/release name filter, using `*` and `?`. |
 | `POLL_INTERVAL` | `300` | How often to check Git. |
@@ -171,6 +171,11 @@ All of these are optional. Times are in seconds.
 | `LOG_RETENTION_DAYS` | `30` | Days of application logs to retain. |
 | `LOG_MAX_FILE_SIZE` | `10M` | Maximum size of each daily log page, including frontmatter. |
 | `LOG_MAX_TOTAL_SIZE` | `1G` | Maximum combined size of retained application log pages. |
+
+**Upgrading from v0.3.0 or earlier:** Tag mode no longer watches tags across all branches.
+Set `GIT_BRANCH` to the branch you deploy. Only matching tags on its tip or ancestors
+are eligible, newest creator time first (descending tag name breaks ties). If the
+branch is missing or no reachable tag matches, no new revision is selected.
 
 Memory sizes accept bytes or `K`, `M`, `G`, and `T` suffixes (1024-based).
 Log sizes use the same suffixes. The file limit must be at least `1K`, and the
