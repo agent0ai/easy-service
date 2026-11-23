@@ -64,6 +64,22 @@ func CopyTree(ctx context.Context, src, dst string) error {
 	}
 	return nil
 }
+
+func copyWithCheckout(ctx context.Context, base, checkout, rootfs string) error {
+	if base == "" {
+		return fmt.Errorf("missing runtime image filesystem")
+	}
+	if err := CopyTree(ctx, base, rootfs); err != nil {
+		return err
+	}
+	app := filepath.Join(rootfs, "app")
+	// An image's /app symlink is relative to the guest. Replace it before copying the checkout.
+	if err := os.RemoveAll(app); err != nil {
+		return err
+	}
+	return CopyTree(ctx, checkout, app)
+}
+
 func (r Runtime) Prepare(ctx context.Context, id, base, checkout, setup string, env []string) (result string, err error) {
 	dir := filepath.Join(r.Data, "prepared", id)
 	if r.inUse(dir) {
@@ -77,19 +93,14 @@ func (r Runtime) Prepare(ctx context.Context, id, base, checkout, setup string, 
 	if e := state.RemoveSandbox(r.Data, dir); e != nil {
 		return "", e
 	}
-	if e := CopyTree(ctx, base, filepath.Join(dir, "rootfs")); e != nil {
-		return "", e
-	}
-	app := filepath.Join(dir, "rootfs", "app")
-	// An image's /app symlink is relative to the container filesystem, not the
-	// supervisor. Replace it before any host copy can follow it out of rootfs.
-	if e := os.RemoveAll(app); e != nil {
-		return "", e
-	}
-	if e := CopyTree(ctx, checkout, app); e != nil {
-		return "", e
-	}
-	if setup != "" {
+	if setup == "" {
+		if e := CopyTree(ctx, checkout, filepath.Join(dir, "app")); e != nil {
+			return "", e
+		}
+	} else {
+		if e := copyWithCheckout(ctx, base, checkout, filepath.Join(dir, "rootfs")); e != nil {
+			return "", e
+		}
 		timeout := r.SetupTimeout
 		if timeout <= 0 {
 			timeout = 15 * time.Minute
@@ -121,12 +132,39 @@ func (r Runtime) ValidatePrepared(dir string) error {
 	if r.inUse(dir) {
 		return fmt.Errorf("prepared filesystem is still in use")
 	}
-	for _, path := range []string{filepath.Join(dir, ".easy-service-ready"), filepath.Join(dir, "rootfs"), filepath.Join(dir, "rootfs", "app")} {
-		if st, err := os.Stat(path); err != nil || (path != filepath.Join(dir, ".easy-service-ready") && !st.IsDir()) {
-			return fmt.Errorf("prepared installation invalid at %s", filepath.Base(path))
+	if _, err := os.Stat(filepath.Join(dir, ".easy-service-ready")); err != nil {
+		return err
+	}
+	_, err := preparedRoot(dir)
+	return err
+}
+
+func preparedRoot(dir string) (string, error) {
+	root := filepath.Join(dir, "rootfs")
+	info, err := os.Lstat(root)
+	if errors.Is(err, os.ErrNotExist) {
+		app, err := os.Lstat(filepath.Join(dir, "app"))
+		if err == nil && app.IsDir() {
+			return dir, nil
+		}
+	} else if err == nil && info.IsDir() {
+		app, err := os.Stat(filepath.Join(root, "app"))
+		if err == nil && app.IsDir() {
+			return root, nil
 		}
 	}
-	return nil
+	return "", fmt.Errorf("prepared installation invalid at %s", dir)
+}
+
+func CopyPrepared(ctx context.Context, base, prepared, rootfs string) error {
+	root, err := preparedRoot(prepared)
+	if err != nil {
+		return err
+	}
+	if root == prepared {
+		return copyWithCheckout(ctx, base, filepath.Join(prepared, "app"), rootfs)
+	}
+	return CopyTree(ctx, root, rootfs)
 }
 
 func (r Runtime) inUse(bundle string) bool {
@@ -137,7 +175,7 @@ func (r Runtime) inUse(bundle string) bool {
 	}
 	return false
 }
-func (r Runtime) Start(ctx, lifetime context.Context, id, prepared, command string, env []string) (*Instance, error) {
+func (r Runtime) Start(ctx, lifetime context.Context, id, base, prepared, command string, env []string) (*Instance, error) {
 	bundle := filepath.Join(r.Data, "instances", id)
 	root := filepath.Join(r.Data, "runtime", id)
 	ok := false
@@ -151,7 +189,7 @@ func (r Runtime) Start(ctx, lifetime context.Context, id, prepared, command stri
 		return nil, e
 	}
 	began := time.Now()
-	if e := CopyTree(ctx, filepath.Join(prepared, "rootfs"), filepath.Join(bundle, "rootfs")); e != nil {
+	if e := CopyPrepared(ctx, base, prepared, filepath.Join(bundle, "rootfs")); e != nil {
 		return nil, e
 	}
 	log.Printf("sandbox copied instance=%s duration=%s", id, time.Since(began))

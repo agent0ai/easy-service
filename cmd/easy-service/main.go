@@ -23,8 +23,8 @@ import (
 
 type runtimeAdapter struct{ sandbox.Runtime }
 
-func (r runtimeAdapter) Start(c, lifetime context.Context, a, b, d string, e []string) (supervisor.Instance, error) {
-	return r.Runtime.Start(c, lifetime, a, b, d, e)
+func (r runtimeAdapter) Start(op, lifetime context.Context, id, base, prepared, command string, env []string) (supervisor.Instance, error) {
+	return r.Runtime.Start(op, lifetime, id, base, prepared, command, env)
 }
 func (r runtimeAdapter) Restart(c context.Context, a, b, d string, e []string) (supervisor.Instance, error) {
 	return r.Runtime.Restart(c, a, b, d, e)

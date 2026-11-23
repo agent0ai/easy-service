@@ -238,24 +238,47 @@ func TestPreparedValidationRequiresCompleteInstallation(t *testing.T) {
 	}
 }
 
-func TestImageAppSymlinkCannotEscapePreparation(t *testing.T) {
+func TestCheckoutOnlyPreparationAndPrivateCopies(t *testing.T) {
+	ctx := context.Background()
 	base, checkout, outside := t.TempDir(), t.TempDir(), t.TempDir()
 	if err := os.Symlink(outside, filepath.Join(base, "app")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(base, "image-file"), []byte("base"), 0600); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(filepath.Join(checkout, "source"), []byte("committed"), 0600); err != nil {
 		t.Fatal(err)
 	}
 	r := Runtime{Data: t.TempDir()}
-	prepared, err := r.Prepare(context.Background(), "test", base, checkout, "", nil)
+	prepared, err := r.Prepare(ctx, "test", base, checkout, "", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := os.Stat(filepath.Join(outside, "source")); !os.IsNotExist(err) {
-		t.Fatal("preparation followed the image /app symlink into the host")
-	}
 	if err := r.ValidatePrepared(prepared); err != nil {
 		t.Fatal(err)
+	}
+	if _, err := os.Lstat(filepath.Join(prepared, "rootfs")); !os.IsNotExist(err) {
+		t.Fatal("checkout-only preparation retained an image copy:", err)
+	}
+	first, second := filepath.Join(t.TempDir(), "rootfs"), filepath.Join(t.TempDir(), "rootfs")
+	if err := CopyPrepared(ctx, base, prepared, first); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(first, "app", "source"), []byte("changed"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := CopyPrepared(ctx, base, prepared, second); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := os.ReadFile(filepath.Join(second, "app", "source")); err != nil || string(got) != "committed" {
+		t.Fatalf("replacement checkout: %q, %v", got, err)
+	}
+	if got, err := os.ReadFile(filepath.Join(second, "image-file")); err != nil || string(got) != "base" {
+		t.Fatalf("replacement image: %q, %v", got, err)
+	}
+	if _, err := os.Stat(filepath.Join(outside, "source")); !os.IsNotExist(err) {
+		t.Fatal("candidate followed the image /app symlink into the host")
 	}
 }
 

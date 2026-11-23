@@ -24,6 +24,7 @@ Own the serialized deployment, cutover, drain and recovery engine.
 - Status reports service state, short instance identity, pending configuration, active revision, runtime image/digest and CPU/RAM usage, limit or sampling error for all live setup/candidate/running/draining instances; include running/queued apply IDs and the last apply result/error without configuration values.
 - Save the configured Git source URL on deployment and recovery so startup cannot reuse a revision from another repository sharing the data directory.
 - Preparation identity includes format version 3, full SHA, image digest, setup command and application environment. The version invalidates installations prepared under the previous runtime ownership model. Runtime-assigned ports and run-command-only changes reuse preparation.
+- Pass the selected cached image root to every fresh launch, including recovery. A checkout-only preparation can rebuild a candidate without a Git fetch.
 - Reject invalid revision selections before filesystem/preparation work.
 - The first serving-instance failure interrupts a candidate for active recovery. Retrying that same candidate's deployment inputs may finish despite another serving failure, so a crash loop cannot repeatedly cancel its repair. Memory replacements still cancel when their original instance fails. Never route an exited/cancelled candidate.
 - Memory pressure requests same-revision deployment through the same cutover/readiness/drain engine.
@@ -60,7 +61,7 @@ Own the serialized deployment, cutover, drain and recovery engine.
 - `go test -race ./internal/supervisor -run TestDeploymentSoak -timeout 10m -v -args -soak=3m` exercises sustained traffic, updates, bad/stalled commits, replacement, repeated crashes and resource bounds.
 - TestKillAllRetiredInstancesKeepsActiveAndCleansFailedStops and TestControlActionsWithLocalGit verify urgent force-stop while redeploy is blocked by a live SSE stream.
 - Real OCI/PRoot execution under default Docker policies remains a separate check.
-- TestSavedSandboxResumeAndFreshFallback checks reuse of writable state, policy persistence, rejected/missing saved installations, failed state publication and changed environment/command/image inputs. Publication failure or cancelled initial recovery preserves accepted files.
+- TestSavedSandboxResumeAndFreshFallback checks reuse of writable state, policy persistence, rejected/missing saved installations, failed state publication and changed environment/command/image inputs. A missing saved installation rebuilds with the Git mirror unavailable. Publication failure or cancelled initial recovery preserves accepted files.
 - TestRepeatedActiveFailuresDoNotStarvePendingRepair and TestRepairRetrySurvivesAnotherServingCrash cover repair deployment during crash loops while retaining the first interruption for active recovery.
 
 ## Child DOX Index

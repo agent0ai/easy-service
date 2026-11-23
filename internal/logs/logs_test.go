@@ -17,7 +17,8 @@ func TestDailyPagesRetentionAndRestart(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	now := time.Date(2026, 10, 6, 23, 59, 0, 0, time.UTC)
+	yesterday := time.Now().UTC().AddDate(0, 0, -1)
+	now := time.Date(yesterday.Year(), yesterday.Month(), yesterday.Day(), 23, 59, 0, 0, time.UTC)
 	m.now = func() time.Time { return now }
 	info := Info{ID: "abc123def456", Commit: strings.Repeat("a", 40), Image: "node:22", DeployedAt: now}
 	m.Register(info.ID, info)
@@ -66,7 +67,7 @@ func TestDailyPagesRetentionAndRestart(t *testing.T) {
 	names := check()
 	found := false
 	for _, name := range names {
-		if strings.Contains(name, "2026-10-07") {
+		if strings.Contains(name, now.Format(time.DateOnly)) {
 			found = true
 		}
 	}

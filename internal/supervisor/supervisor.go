@@ -42,7 +42,7 @@ type Runtime interface {
 	Prepare(context.Context, string, string, string, string, []string) (string, error)
 	ValidatePrepared(string) error
 	// Start separates filesystem-operation cancellation from process lifetime.
-	Start(context.Context, context.Context, string, string, string, []string) (Instance, error)
+	Start(op, lifetime context.Context, id, base, prepared, command string, env []string) (Instance, error)
 	Restart(context.Context, string, string, string, []string) (Instance, error)
 }
 type Checkout interface {
@@ -248,7 +248,7 @@ func (e *Engine) deployWith(ctx, watchCtx context.Context, sel revision.Selectio
 			candidate, err = plan.Runtime.Restart(e.runtimeContext(watchCtx), id, resume, plan.Cfg.RunCommand, plan.Cfg.AppEnv)
 		} else {
 			log.Printf("starting candidate instance=%s revision=%s", id, sel.SHA)
-			candidate, err = plan.Runtime.Start(ctx, e.runtimeContext(watchCtx), id, prepared, plan.Cfg.RunCommand, plan.Cfg.AppEnv)
+			candidate, err = plan.Runtime.Start(ctx, e.runtimeContext(watchCtx), id, plan.Rootfs, prepared, plan.Cfg.RunCommand, plan.Cfg.AppEnv)
 		}
 		if e.Logs != nil {
 			e.Logs.Forget(id)
@@ -438,7 +438,7 @@ func (e *Engine) prepareWith(ctx context.Context, sha, id string, plan Deploymen
 			defer e.Logs.Forget("setup-" + prepID)
 		}
 	}
-	log.Printf("running setup instance=%s revision=%s", id, sha)
+	log.Printf("preparing deployment instance=%s revision=%s", id, sha)
 	result, err := plan.Runtime.Prepare(ctx, prepID, plan.Rootfs, checkout, plan.Cfg.SetupCommand, plan.Cfg.AppEnv)
 	if err != nil {
 		return "", fmt.Errorf("prepare candidate: %w", err)
@@ -577,7 +577,7 @@ func (e *Engine) recover(ctx, watchCtx context.Context, generation uint64, force
 			return prepErr
 		}
 		e.registerLog(id, id, a.Revision, e.snapshot())
-		inst, err = e.Runtime.Start(ctx, e.runtimeContext(watchCtx), id, prepared, e.Cfg.RunCommand, e.Cfg.AppEnv)
+		inst, err = e.Runtime.Start(ctx, e.runtimeContext(watchCtx), id, e.Rootfs, prepared, e.Cfg.RunCommand, e.Cfg.AppEnv)
 		log.Printf("redeploying revision %s with fresh writable filesystem", a.Revision)
 	}
 	if e.Logs != nil {

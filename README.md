@@ -36,6 +36,8 @@ Only `GIT_URL` and `RUN_COMMAND` are required. `RUNTIME_IMAGE` defaults to
 `node:22-bookworm-slim` or `python:3.12-slim`. Short image names work, and you can
 also use full registry names or pinned digests. `SETUP_COMMAND` installs your
 application's dependencies and can be omitted if none are needed.
+Without setup, easy-service caches the checkout alone and copies the runtime
+image directly into each fresh instance.
 
 Commands run in `/app` using `/bin/sh`. Keep the server running in the foreground
 and make it listen on `$PORT`, assigned automatically for each instance. Pass

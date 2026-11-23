@@ -16,6 +16,7 @@ Own OCI filesystem execution through PRoot, Linux user isolation and whole-insta
 - Preserve image environment and explicit APP_* values, reserving only assigned PORT; default HOME is /root. Keep tracer environment separate from the guest environment.
 - Assign an available PORT for every setup/start/restart; endpoints must match it so overlapping instances can serve concurrently.
 - Copy private writable rootfs trees, replace image /app and /tmp symlinks before host access, retain HOME/tmp setup writes, and never follow image symlinks during recursive ownership changes.
+- With no setup command, cache only the checkout in prepared/app and assemble a fresh candidate from the cached image and checkout. With setup, cache the installed prepared/rootfs. Accept existing complete prepared trees for reuse.
 - Record ownership only after the first complete chown. Reused sandboxes skip the rootfs copy and ownership walk; each launch still gets fresh runtime metadata, DNS, tracer storage and PORT. Log copy/initial ownership durations without configuration values.
 - DATA_DIR and managed instance parents permit traversal; rootfs and tracer temporary storage belong only to the leased UID. Root-owned launch settings stay private. Custom DATA_DIR ancestors must permit directory traversal.
 - Supply an owned read-only resolver copy using PRoot path translation; guest resolver symlinks cannot redirect host writes.
@@ -35,6 +36,7 @@ Own OCI filesystem execution through PRoot, Linux user isolation and whole-insta
 
 - `go test -race ./internal/sandbox` checks overlapping ports/UIDs, private file ownership, privilege restrictions, detached-child CPU/RAM, whole-instance kill, peer survival and retained failure output.
 - Repeated restart coverage verifies unchanged filesystem inodes/ctime and UID, proving that reuse does not copy/reown retained files.
+- TestCheckoutOnlyPreparationAndPrivateCopies checks checkout-only storage, isolated candidate writes and safe replacement of an OCI /app symlink.
 - Actual OCI/PRoot checks belong to cmd/easy-service/real_test.go; fakes do not verify OCI syscall compatibility.
 
 ## Child DOX Index

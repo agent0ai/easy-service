@@ -406,7 +406,7 @@ func main() {
 	if err != nil {
 		t.Fatal(err)
 	}
-	instance, err := rt.Start(ctx, ctx, "go-server", prepared, "exec ./bin/server", env)
+	instance, err := rt.Start(ctx, ctx, "go-server", image.Rootfs, prepared, "exec ./bin/server", env)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -62,6 +62,9 @@ func TestSavedSandboxResumeAndFreshFallback(t *testing.T) {
 				if err := os.RemoveAll(oldBundle); err != nil {
 					t.Fatal(err)
 				}
+				if err := os.Rename(git.Mirror, git.Mirror+"-offline"); err != nil {
+					t.Fatal(err)
+				}
 			case "changed-environment":
 				e.Cfg.AppEnv = []string{"MODE=changed"}
 			case "changed-command":

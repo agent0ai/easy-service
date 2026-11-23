@@ -32,7 +32,7 @@ type settingsRuntime struct {
 	env    []string
 }
 
-func (r *settingsRuntime) Start(op, lifetime context.Context, id, prepared, command string, env []string) (Instance, error) {
+func (r *settingsRuntime) Start(op, lifetime context.Context, id, base, prepared, command string, env []string) (Instance, error) {
 	r.mu.Lock()
 	r.starts++
 	r.env = append([]string(nil), env...)
@@ -40,7 +40,7 @@ func (r *settingsRuntime) Start(op, lifetime context.Context, id, prepared, comm
 	if command == "fail-start" {
 		return nil, fmt.Errorf("configured command failed")
 	}
-	return r.httpRuntime.Start(op, lifetime, id, prepared, command, env)
+	return r.httpRuntime.Start(op, lifetime, id, base, prepared, command, env)
 }
 func (r *settingsRuntime) count() int { r.mu.Lock(); defer r.mu.Unlock(); return r.starts }
 

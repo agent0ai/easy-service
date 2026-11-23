@@ -160,8 +160,8 @@ type contextRuntime struct {
 	contexts []context.Context
 }
 
-func (r *contextRuntime) Start(op, ctx context.Context, id, prepared, command string, env []string) (Instance, error) {
-	i, err := r.fr.Start(op, ctx, id, prepared, command, env)
+func (r *contextRuntime) Start(op, ctx context.Context, id, base, prepared, command string, env []string) (Instance, error) {
+	i, err := r.fr.Start(op, ctx, id, base, prepared, command, env)
 	if err != nil {
 		return nil, err
 	}
@@ -202,7 +202,7 @@ func (r *fr) Prepare(_ context.Context, id string, _ string, _ string, _ string,
 func (r *fr) ValidatePrepared(path string) error {
 	return (sandbox.Runtime{}).ValidatePrepared(path)
 }
-func (r *fr) Start(_ context.Context, _ context.Context, id string, _ string, _ string, _ []string) (Instance, error) {
+func (r *fr) Start(_ context.Context, _ context.Context, id string, _, _, _ string, _ []string) (Instance, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.starts++
